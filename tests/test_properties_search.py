@@ -9,7 +9,21 @@ from hypothesis import strategies as st
 from openrent.cli import money
 from openrent.models import Candidate, Property, SearchData
 from openrent.parsing import money_pence
-from openrent.search import SearchError, SearchOptions, pence
+from openrent.search import (
+    ApiFilters,
+    SearchError,
+    WebsiteFilters,
+    matches_criteria,
+    pence,
+)
+
+
+def filters(**fields):
+    api = ApiFilters(
+        **{name: fields.pop(name) for name in ApiFilters.__dataclass_fields__ if name in fields}
+    )
+    fields.setdefault("include_unavailable", False)
+    return api, WebsiteFilters(**fields)
 
 
 def pounds(cents):
@@ -42,7 +56,7 @@ def test_money_round_trips_pennies_and_inclusive_rent_boundaries(
 ):
     upper_cents = lower_cents + width
     source = SearchData([])
-    options = SearchOptions(
+    options = filters(
         location="London",
         radius_distance=2,
         rent_min=pounds(lower_cents),
@@ -54,13 +68,13 @@ def test_money_round_trips_pennies_and_inclusive_rent_boundaries(
             assert pence(representation) == cents
         assert pence(money(str(amount))) == cents
         assert money_pence(f"£{amount:,.2f} pcm") == cents
-        assert options.matches(listing(rent_pcm_pence=cents), source)
+        assert matches_criteria(*options, listing(rent_pcm_pence=cents), source)
     assert pence(lower_cents // 100) == (lower_cents // 100) * 100
     if lower_cents:
-        assert not options.matches(listing(rent_pcm_pence=lower_cents - 1), source)
-    assert not options.matches(listing(rent_pcm_pence=upper_cents + 1), source)
+        assert not matches_criteria(*options, listing(rent_pcm_pence=lower_cents - 1), source)
+    assert not matches_criteria(*options, listing(rent_pcm_pence=upper_cents + 1), source)
     with pytest.raises(SearchError, match="rent_pcm_pence"):
-        options.matches(listing(rent_pcm_pence=None), source)
+        matches_criteria(*options, listing(rent_pcm_pence=None), source)
 
     # Source adverts round half-pennies up; user constraints must be exact pennies.
     # Integer mill arithmetic supplies an independent rounding oracle.
@@ -106,7 +120,7 @@ def test_tightening_local_filters_on_same_candidates_never_adds_listings(
     # about inventory or results returned by different live OpenRent requests.
     wide_radius, narrow_radius = max(radii) / 100, min(radii) / 100
     common = {"location": "London"}
-    wide = SearchOptions(
+    wide = filters(
         **common,
         radius_distance=wide_radius,
         rent_min=pounds(rent[0]),
@@ -116,7 +130,7 @@ def test_tightening_local_filters_on_same_candidates_never_adds_listings(
         bathrooms_min=bathrooms[0],
         bathrooms_max=bathrooms[3],
     )
-    narrow = SearchOptions(
+    narrow = filters(
         **common,
         radius_distance=narrow_radius,
         rent_min=pounds(rent[1]),
@@ -147,8 +161,8 @@ def test_tightening_local_filters_on_same_candidates_never_adds_listings(
         bathrooms=bathrooms[1],
     )
     items.append(boundary)
-    wide_ids = {item.property.id for item in items if wide.matches(item, source)}
-    narrow_ids = {item.property.id for item in items if narrow.matches(item, source)}
+    wide_ids = {item.property.id for item in items if matches_criteria(*wide, item, source)}
+    narrow_ids = {item.property.id for item in items if matches_criteria(*narrow, item, source)}
     assert boundary.property.id in narrow_ids  # The subset check always has a passing witness.
     assert narrow_ids <= wide_ids
 
@@ -161,18 +175,24 @@ def test_tightening_local_filters_on_same_candidates_never_adds_listings(
         ("bedrooms", bedrooms[1], bedrooms[2]),
         ("bathrooms", bathrooms[1], bathrooms[2]),
     ):
-        assert not narrow.matches(
-            listing(distance=narrow_radius, **(boundary_facts | {field: upper + 1})), source
+        assert not matches_criteria(
+            *narrow,
+            listing(distance=narrow_radius, **(boundary_facts | {field: upper + 1})),
+            source,
         )
         if lower:
-            assert not narrow.matches(
-                listing(distance=narrow_radius, **(boundary_facts | {field: lower - 1})), source
+            assert not matches_criteria(
+                *narrow,
+                listing(distance=narrow_radius, **(boundary_facts | {field: lower - 1})),
+                source,
             )
-    assert not narrow.matches(listing(distance=narrow_radius + 0.01, **boundary_facts), source)
+    assert not matches_criteria(
+        *narrow, listing(distance=narrow_radius + 0.01, **boundary_facts), source
+    )
     for missing_field in ("bedrooms", "bathrooms", "is_shared", "is_studio"):
         missing = listing(distance=narrow_radius, **(boundary_facts | {missing_field: None}))
         with pytest.raises(SearchError, match=missing_field):
-            narrow.matches(missing, source)
+            matches_criteria(*narrow, missing, source)
 
     studio = listing(
         distance=narrow_radius,
@@ -181,7 +201,7 @@ def test_tightening_local_filters_on_same_candidates_never_adds_listings(
         bathrooms=bathrooms[1],
         is_studio=True,
     )
-    assert narrow.matches(studio, source) is (bedrooms[1] == 0)
+    assert matches_criteria(*narrow, studio, source) is (bedrooms[1] == 0)
     shared = listing(
         distance=narrow_radius,
         rent_pcm_pence=rent[1],
@@ -190,8 +210,8 @@ def test_tightening_local_filters_on_same_candidates_never_adds_listings(
         is_shared=True,
         is_studio=True,
     )
-    assert not narrow.matches(shared, source)  # Rooms have effective bedroom count -1.
-    assert SearchOptions(**common, radius_distance=narrow_radius).matches(shared, source)
+    assert not matches_criteria(*narrow, shared, source)  # Rooms have effective bedroom count -1.
+    assert matches_criteria(*filters(**common, radius_distance=narrow_radius), shared, source)
 
 
 FEATURES = {
@@ -232,7 +252,7 @@ FACTS = st.fixed_dictionaries(
 @settings(max_examples=200)
 @given(flags=FLAGS, facts=FACTS, furnishing=st.sampled_from(("any", "furnished", "unfurnished")))
 def test_requested_features_obey_three_valued_data_contract(flags, facts, furnishing):
-    options = SearchOptions(location="London", radius_distance=2, furnishing=furnishing, **flags)
+    options = filters(location="London", radius_distance=2, furnishing=furnishing, **flags)
     item = listing(rent_pcm_pence=None, bedrooms=None, bathrooms=None, **facts)
     source = SearchData([])
     required_fields = {stored for requested, stored in FEATURES.items() if flags[requested]}
@@ -250,7 +270,7 @@ def test_requested_features_obey_three_valued_data_contract(flags, facts, furnis
     missing = {field for field in required_fields if facts[field] is None}
     if missing:
         with pytest.raises(SearchError) as caught:
-            options.matches(item, source)
+            matches_criteria(*options, item, source)
         assert any(field in str(caught.value) for field in missing)
     else:
         accepted = (
@@ -261,9 +281,9 @@ def test_requested_features_obey_three_valued_data_contract(flags, facts, furnis
             and (not flags["video"] or video_positive)
             and (furnishing == "any" or facts[furnishing] is True)
         )
-        assert options.matches(item, source) is accepted
+        assert matches_criteria(*options, item, source) is accepted
 
     # Unknown facts, including numeric facts, are irrelevant when not requested.
-    assert SearchOptions(location="London", radius_distance=2, include_unavailable=True).matches(
-        item, source
+    assert matches_criteria(
+        *filters(location="London", radius_distance=2, include_unavailable=True), item, source
     )

@@ -5,7 +5,7 @@ import pytest
 
 from openrent.db import Database
 from openrent.export import export_csv
-from openrent.models import Candidate, Image, NearbyPlace, Property
+from openrent.models import Image, NearbyPlace, Property
 
 
 @pytest.fixture
@@ -62,14 +62,7 @@ def archive(tmp_path):
             db.upsert_property(prop)
         db.store_image(10, live.images[2], b"photo contents", "image/jpeg")
         db.store_image(10, live.images[0], b"map contents", "image/png")
-        first = db.upsert_search({"within": "2"}, "Victoria Station, London")
-        db.record_match(first, Candidate(live, distance_km=1.25, commute_minutes=12.5))
-        db.record_match(first, Candidate(unknown, distance_km=2.5, commute_minutes=19.25))
-        db.finish_search(first, [10], complete=True)
-        second = db.upsert_search({"within": "10"}, "Waterloo Station, London")
-        db.record_match(second, Candidate(live, distance_km=99, commute_minutes=90))
-        db.record_match(second, Candidate(withdrawn, distance_km=3, commute_minutes=31))
-    return path, first, second
+    return path
 
 
 def read_csv(path):
@@ -79,7 +72,7 @@ def read_csv(path):
 
 def test_station_modes_known_walking_estimates_ties_and_missing_values(archive, tmp_path):
     output = tmp_path / "stations.csv"
-    export_csv(archive[0], output)
+    export_csv(archive, output)
     rows = read_csv(output)
     assert rows[0]["nearest_tube_station"] == "Alpha Tube"
     assert rows[0]["nearest_tube_walk_minutes"] == "5"
@@ -93,7 +86,7 @@ def test_station_modes_known_walking_estimates_ties_and_missing_values(archive, 
 
 def test_image_export_uses_first_photo_url_and_photo_counts(archive, tmp_path):
     output = tmp_path / "images.csv"
-    export_csv(archive[0], output, ["id", "image_url", "photo_count", "downloaded_photo_count"])
+    export_csv(archive, output, ["id", "image_url", "photo_count", "downloaded_photo_count"])
     rows = read_csv(output)
     assert rows[0] == {
         "id": "10",
@@ -127,32 +120,8 @@ def test_missing_database_is_not_created_and_preserves_output(tmp_path):
 
 def test_global_active_filter_uses_listing_availability(archive, tmp_path):
     output = tmp_path / "active.csv"
-    assert export_csv(archive[0], output, ["id", "is_live"], active_only=True) == 1
+    assert export_csv(archive, output, ["id", "is_live"], active_only=True) == 1
     assert read_csv(output) == [{"id": "10", "is_live": "1"}]
-
-
-def test_selected_search_matches_and_location_specific_values(archive, tmp_path):
-    db_path, first, second = archive
-    output = tmp_path / "search.csv"
-    columns = ["id", "distance_km", "commute_minutes", "search_active"]
-    assert export_csv(db_path, output, columns, search_id=first) == 2
-    assert read_csv(output) == [
-        {"id": "10", "distance_km": "1.25", "commute_minutes": "12.5", "search_active": "1"},
-        {"id": "20", "distance_km": "2.5", "commute_minutes": "19.25", "search_active": "0"},
-    ]
-    assert export_csv(db_path, output, columns, search_id=first, active_only=True) == 1
-    assert read_csv(output)[0]["id"] == "10"
-    assert export_csv(db_path, output, columns, search_id=second, active_only=True) == 2
-    assert [row["id"] for row in read_csv(output)] == ["10", "30"]
-    assert read_csv(output)[0]["distance_km"] == "99.0"
-
-
-def test_unknown_search_fails_before_replacing_existing_output(archive, tmp_path):
-    output = tmp_path / "out.csv"
-    output.write_bytes(b"keep me")
-    with pytest.raises(ValueError, match="Unknown search ID"):
-        export_csv(archive[0], output, search_id="does-not-exist")
-    assert output.read_bytes() == b"keep me"
 
 
 @pytest.mark.parametrize("columns", [["source_html"]])
@@ -160,7 +129,7 @@ def test_invalid_columns_fail_before_replacing_existing_output(archive, tmp_path
     output = tmp_path / "out.csv"
     output.write_bytes(b"keep me")
     with pytest.raises(ValueError):
-        export_csv(archive[0], output, columns)
+        export_csv(archive, output, columns)
     assert output.read_bytes() == b"keep me"
 
 
@@ -180,7 +149,7 @@ def test_write_failure_preserves_existing_output_and_cleans_temporary_file(
 
     monkeypatch.setattr("openrent.export.csv.writer", lambda stream: FailingWriter())
     with pytest.raises(OSError, match="Disk write failure"):
-        export_csv(archive[0], output)
+        export_csv(archive, output)
     assert output.read_bytes() == b"keep me"
     assert not list(tmp_path.glob(".out.csv.*.tmp"))
 
@@ -196,14 +165,14 @@ def test_replace_failure_preserves_existing_output_and_cleans_temporary_file(
 
     monkeypatch.setattr("openrent.export.os.replace", fail_replace)
     with pytest.raises(OSError, match="Cannot replace result"):
-        export_csv(archive[0], output)
+        export_csv(archive, output)
     assert output.read_bytes() == b"keep me"
     assert not list(tmp_path.glob(".out.csv.*.tmp"))
 
 
 @pytest.mark.parametrize("alias", ["direct", "hardlink"])
 def test_database_cannot_be_used_as_csv_output(archive, tmp_path, alias):
-    db_path = archive[0]
+    db_path = archive
     before = db_path.read_bytes()
     output = db_path
     if alias == "hardlink":
@@ -216,10 +185,10 @@ def test_database_cannot_be_used_as_csv_output(archive, tmp_path, alias):
 
 @pytest.mark.parametrize(
     "suffix, alias",
-    [(".scan.lock", "direct"), ("-shm", "symlink")],
+    [(".scan.lock", "direct"), ("-shm", "symlink"), (".review.sqlite", "hardlink")],
 )
 def test_database_sidecars_and_scan_lock_cannot_be_overwritten(archive, tmp_path, suffix, alias):
-    db_path = archive[0]
+    db_path = archive
     protected = db_path.with_name(db_path.name + suffix)
     content = b"existing sqlite sidecar or held scan lock"
     protected.write_bytes(content)
@@ -227,15 +196,18 @@ def test_database_sidecars_and_scan_lock_cannot_be_overwritten(archive, tmp_path
     if alias == "symlink":
         output = tmp_path / "sidecar-alias.csv"
         output.symlink_to(protected)
+    elif alias == "hardlink":
+        output = tmp_path / "review-alias.csv"
+        output.hardlink_to(protected)
     with pytest.raises(ValueError, match="its sidecars, or scan lock"):
         export_csv(db_path, output)
     assert protected.read_bytes() == content
     assert output.read_bytes() == content
 
 
-@pytest.mark.parametrize("suffix", ["-wal"])
+@pytest.mark.parametrize("suffix", ["-wal", ".review.sqlite-wal", ".review.scan.lock"])
 def test_database_sidecar_paths_are_rejected_before_they_exist(archive, suffix):
-    db_path = archive[0]
+    db_path = archive
     output = db_path.with_name(db_path.name + suffix)
     assert not output.exists()
     with pytest.raises(ValueError, match="its sidecars, or scan lock"):

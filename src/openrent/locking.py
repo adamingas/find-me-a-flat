@@ -1,4 +1,4 @@
-"""Process locks prevent a daemon and manual scan from modifying the same archive together."""
+"""Process locks keep optional review jobs from running simultaneously."""
 
 import os
 from pathlib import Path
@@ -29,9 +29,7 @@ class ScanLock:
         except OSError as exc:
             self.handle.close()
             self.handle = None
-            raise ValueError(
-                f"Another scan or daemon holds the database lock: {self.path}"
-            ) from exc
+            raise ValueError(f"Another process holds the database lock: {self.path}") from exc
         self.handle.seek(0)
         self.handle.truncate()
         self.handle.write(f"{os.getpid()}\n")

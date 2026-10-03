@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from openrent.db import SCHEMA_VERSION, Database
-from openrent.models import Candidate, Feature, Image, MediaLink, NearbyPlace, Property
+from openrent.models import Feature, Image, MediaLink, NearbyPlace, Property
 
 
 @pytest.fixture
@@ -114,44 +114,6 @@ def test_failed_images_are_retryable_without_losing_a_successful_download(db, pr
     assert db.counts()["failed_images"] == 0
 
 
-def test_incomplete_search_never_deactivates_previous_matches(db, property):
-    search_id = db.upsert_search({"maxRent": "2000"}, "London")
-    second = replace(property, id=54321)
-    db.record_match(search_id, Candidate(property, commute_minutes=15))
-    db.record_match(search_id, Candidate(second, commute_minutes=19))
-    db.finish_search(search_id, [property.id], complete=False)
-    assert db.connection.execute("SELECT sum(active) FROM search_matches").fetchone()[0] == 2
-
-    db.finish_search(search_id, [property.id], complete=True)
-    active = dict(db.connection.execute("SELECT property_id, active FROM search_matches"))
-    assert active == {property.id: 1, second.id: 0}
-    assert db.get_property(second.id)["is_live"] is None
-    db.record_match(search_id, Candidate(second))
-    assert db.connection.execute("SELECT sum(active) FROM search_matches").fetchone()[0] == 2
-    assert (
-        db.connection.execute(
-            "SELECT commute_minutes FROM search_matches WHERE property_id = ?", (second.id,)
-        ).fetchone()[0]
-        == 19
-    )
-    db.finish_search(search_id, [], complete=True)
-    assert db.connection.execute("SELECT sum(active) FROM search_matches").fetchone()[0] == 0
-
-
-def test_starting_search_resets_completion_flag_without_erasing_last_success(db):
-    search_id = db.upsert_search({"maxRent": "2000"}, "London")
-    db.finish_search(search_id, [], complete=True)
-    completed = db.connection.execute("SELECT * FROM searches").fetchone()
-    assert completed["last_search_complete"] == 1
-    assert completed["last_completed_at"] is not None
-
-    assert db.upsert_search({"maxRent": "2000"}, "London") == search_id
-    interrupted = db.connection.execute("SELECT * FROM searches").fetchone()
-    assert interrupted["last_search_complete"] == 0
-    assert interrupted["last_completed_at"] == completed["last_completed_at"]
-    assert db.counts()["searches"] == 1
-
-
 def test_invalid_child_rolls_back_entire_property_update(db, property):
     db.upsert_property(property)
     original_counts = db.counts()
@@ -172,10 +134,15 @@ def test_schema_version_foreign_keys_and_reopening_archive(tmp_path, property):
         assert db.connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert db.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         db.upsert_property(property)
-        with pytest.raises(sqlite3.IntegrityError):
+        # A concurrent filter can delete a listing while its download is in flight.
+        assert (
             db.store_image(
                 999, Image("https://images.openrent.co.uk/no-property.jpg"), b"image", "image/jpeg"
             )
+            is False
+        )
+        db.record_image_error(999, "https://images.openrent.co.uk/no-property.jpg", "503")
+        assert db.counts()["properties"] == 1
     with Database(path) as db:
         assert db.upsert_property(property) is False
         assert db.counts()["properties"] == 1
@@ -183,3 +150,46 @@ def test_schema_version_foreign_keys_and_reopening_archive(tmp_path, property):
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
     with pytest.raises(ValueError, match="newer than supported"):
         Database(path)
+
+
+def test_parallel_writers_merge_overlapping_ids_with_atomic_metadata_and_images(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    path = tmp_path / "shared.sqlite"
+    ready = Barrier(4, timeout=10)
+
+    def ingest(worker):
+        ready.wait()  # Exercise concurrent initialization of a fresh database too.
+        with Database(path) as db:
+            ready.wait()
+            for property_id in [*range(1, 31), 100 + worker]:
+                image = Image(f"https://images.openrent.co.uk/{property_id}.jpg")
+                prop = Property(
+                    property_id,
+                    f"https://www.openrent.co.uk/{property_id}",
+                    rent_pcm_pence=100000 + worker,
+                    description=str(worker),
+                    features=[Feature("worker", "Worker", value=worker)],
+                    images=[image],
+                    detail_complete=True,
+                )
+                db.upsert_property(prop)
+                db.store_image(property_id, image, b"shared image bytes", "image/jpeg")
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(ingest, range(4)))
+    with Database(path) as db:
+        counts = db.counts()
+        assert (
+            counts["properties"] == counts["property_features"] == counts["downloaded_images"] == 34
+        )
+        assert counts["image_blobs"] == 1
+        for row in db.connection.execute("SELECT * FROM properties"):
+            worker = int(row["description"])
+            assert row["rent_pcm_pence"] == 100000 + worker
+            feature = db.connection.execute(
+                "SELECT value_integer FROM property_features WHERE property_id = ?", (row["id"],)
+            ).fetchone()[0]
+            assert feature == worker
+        assert not db.connection.execute("PRAGMA foreign_key_check").fetchall()

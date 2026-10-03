@@ -1,4 +1,4 @@
-"""CLI integration, real process locks, and scheduled selected-search exports."""
+"""CLI integration, real process locks, and scheduled shared-archive exports."""
 
 import csv
 from datetime import UTC, datetime
@@ -10,7 +10,7 @@ from openrent import cli
 from openrent.daemon import run_daemon
 from openrent.db import Database
 from openrent.locking import ScanLock
-from openrent.models import Candidate, Property
+from openrent.models import Property
 
 
 def arguments(db, *extra):
@@ -58,40 +58,36 @@ def test_lock_normalizes_symlink_database_paths(tmp_path):
         pass
 
 
-def test_daemon_lock_also_prevents_manual_scan(tmp_path, monkeypatch):
-    async def forbidden(_):
-        raise AssertionError("A locked database must not be scanned")
+def test_scanners_do_not_take_a_database_wide_process_lock(tmp_path, monkeypatch):
+    calls = []
 
-    monkeypatch.setattr(cli, "fetch", forbidden)
+    async def scan(args):
+        calls.append(args.location)
+        return 0
+
+    monkeypatch.setattr(cli, "fetch", scan)
     db = tmp_path / "archive.sqlite"
+    # An existing legacy lock no longer blocks manual or daemon ingestion.
     with ScanLock(db):
         assert (
-            cli.main(
-                [
-                    "fetch",
-                    "--location",
-                    "Victoria, London",
-                    "--radius-distance",
-                    "2",
-                    "--db",
-                    str(db),
-                ]
-            )
-            == 1
+            cli.main(["fetch", "--location", "London", "--radius-distance", "2", "--db", str(db)])
+            == 0
         )
-        assert cli.main(arguments(db, "--run-now", "--max-runs", "1")) == 1
+        assert cli.main(arguments(db, "--run-now", "--max-runs", "1")) == 0
+    assert calls == ["London", "Victoria, London"]
 
 
-def test_successful_daemon_scan_exports_current_search_once(tmp_path, monkeypatch):
+def test_successful_daemon_scan_exports_shared_archive_once(tmp_path, monkeypatch):
     db = tmp_path / "archive.sqlite"
     output = tmp_path / "listings.csv"
     calls = []
 
     async def scan(args):
         calls.append(args.location)
-        options = cli.scan_options(args)
         with Database(args.db) as archive:
-            archive.upsert_property(Property(999, "https://www.openrent.co.uk/999", title="Other"))
+            archive.upsert_property(
+                Property(999, "https://www.openrent.co.uk/999", title="Other", is_live=True)
+            )
             prop = Property(
                 101,
                 "https://www.openrent.co.uk/101",
@@ -100,9 +96,6 @@ def test_successful_daemon_scan_exports_current_search_once(tmp_path, monkeypatc
                 is_live=True,
             )
             archive.upsert_property(prop)
-            search_id = archive.upsert_search(options.identity_parameters(), options.location)
-            archive.record_match(search_id, Candidate(prop, 1.2))
-            archive.finish_search(search_id, [101], complete=True)
         return 0
 
     monkeypatch.setattr(cli, "fetch", scan)
@@ -114,7 +107,7 @@ def test_successful_daemon_scan_exports_current_search_once(tmp_path, monkeypatc
         "--export-csv",
         str(output),
         "--export-columns",
-        "id,title,rent_pcm,distance_km",
+        "id,title,rent_pcm",
     )
     assert cli.main(args) == 0
     first = output.read_bytes()
@@ -123,7 +116,8 @@ def test_successful_daemon_scan_exports_current_search_once(tmp_path, monkeypatc
     with output.open(newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert rows == [
-        {"id": "101", "title": "Example Flat", "rent_pcm": "1234.56", "distance_km": "1.2"}
+        {"id": "101", "title": "Example Flat", "rent_pcm": "1234.56"},
+        {"id": "999", "title": "Other", "rent_pcm": ""},
     ]
     assert calls == ["Victoria, London", "Victoria, London"]
 
@@ -139,17 +133,6 @@ def test_failed_daemon_scan_preserves_previous_csv(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "fetch", failure)
     assert cli.main(arguments(db, "--run-now", "--max-runs", "1", "--export-csv", str(output))) == 1
     assert output.read_text() == "previous snapshot"
-
-
-def test_partial_scan_export_configuration_rejected(tmp_path, monkeypatch):
-    async def forbidden(_):
-        pytest.fail("Must reject before scanning")
-
-    monkeypatch.setattr(cli, "fetch", forbidden)
-    db = tmp_path / "archive.sqlite"
-    output = tmp_path / "listings.csv"
-    assert cli.main(arguments(db, "--limit", "1", "--export-csv", str(output))) == 1
-    assert not output.exists()
 
 
 @pytest.mark.parametrize("suffix", ["", ".scan.lock"])

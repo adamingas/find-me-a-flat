@@ -7,13 +7,16 @@ import json
 import math
 import sqlite3
 from datetime import UTC, datetime
+from itertools import batched
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
-from .models import Candidate, Feature, Image, Property
+from . import filtering
+from .models import Feature, Image, Property
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 6
+REVIEW_SCHEMA_VERSION = 4
 
 # Keep this explicit: a dataclass addition must be accompanied by a schema change.
 PROPERTY_COLUMNS = (
@@ -73,14 +76,16 @@ TABLES = (
     "property_features",
     "nearby_places",
     "media_links",
-    "searches",
-    "search_filters",
-    "search_matches",
 )
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds")
+
+
+def review_path_for(path: str | Path) -> Path | None:
+    """Append to the resolved filename so different archive extensions cannot collide."""
+    return None if str(path) == ":memory:" else Path(str(Path(path).resolve()) + ".review.sqlite")
 
 
 def _merge_metadata(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
@@ -105,25 +110,249 @@ class Database:
 
     def __init__(self, path: str | Path):
         self.path = Path(path) if str(path) != ":memory:" else None
+        self.review_path = review_path_for(path)
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(str(path), timeout=30)
         self.connection.row_factory = sqlite3.Row
         try:
             self.connection.execute("PRAGMA foreign_keys = ON")
+            try:
+                self.connection.execute("SELECT jsonb('{}')").fetchone()
+            except sqlite3.OperationalError as exc:
+                raise ValueError(
+                    "Review storage requires SQLite 3.45 or newer with native JSONB support."
+                ) from exc
+            self.connection.execute(
+                "ATTACH DATABASE ? AS review",
+                (str(self.review_path) if self.review_path is not None else ":memory:",),
+            )
             version = self.connection.execute("PRAGMA user_version").fetchone()[0]
             if version > SCHEMA_VERSION:
                 raise ValueError(
                     f"Database schema version {version} is newer than supported version "
                     f"{SCHEMA_VERSION}; upgrade openrent-fetch before opening it."
                 )
-            if version < SCHEMA_VERSION:
-                schema = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
-                self.connection.executescript("BEGIN IMMEDIATE;\n" + schema + "\nCOMMIT;")
-            self.connection.execute("PRAGMA journal_mode = WAL")
+            review_version = self.connection.execute("PRAGMA review.user_version").fetchone()[0]
+            if review_version > REVIEW_SCHEMA_VERSION:
+                raise ValueError("Review database was upgraded by a newer application.")
+            if version < SCHEMA_VERSION or review_version < REVIEW_SCHEMA_VERSION:
+                # Moving legacy rows between files requires rollback journals
+                # for crash atomicity. A sidecar-only upgrade writes one file,
+                # so it remains atomic in WAL and can coexist with open scanners.
+                if version < SCHEMA_VERSION:
+                    for namespace in ("main", "review"):
+                        mode = self.connection.execute(
+                            f"PRAGMA {namespace}.journal_mode = DELETE"
+                        ).fetchone()[0]
+                        if self.path is not None and mode != "delete":
+                            raise ValueError(
+                                "Cannot obtain rollback journals for the schema migration."
+                            )
+                with self.connection:
+                    self.connection.execute("BEGIN IMMEDIATE")
+                    version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+                    review_version = self.connection.execute(
+                        "PRAGMA review.user_version"
+                    ).fetchone()[0]
+                    if version > SCHEMA_VERSION or review_version > REVIEW_SCHEMA_VERSION:
+                        raise ValueError("Database was upgraded by a newer application.")
+                    if "search_id" in {
+                        row["name"]
+                        for row in self.connection.execute(
+                            "PRAGMA review.table_info(property_reviews)"
+                        )
+                    }:
+                        self.connection.execute(
+                            "ALTER TABLE review.property_reviews DROP COLUMN search_id"
+                        )
+                    self._migrate_review_notifications(review_version)
+                    self._execute_schema("review_schema.sql")
+                    if version < SCHEMA_VERSION:
+                        self._migrate_legacy_reviews(version)
+                        for table in ("search_matches", "search_filters", "searches"):
+                            self.connection.execute(f"DROP TABLE IF EXISTS {table}")
+                        self._execute_schema("schema.sql")
+            self.connection.execute("PRAGMA main.journal_mode = WAL")
+            self.connection.execute("PRAGMA review.journal_mode = WAL")
         except Exception:
             self.connection.close()
             raise
+
+    def _execute_schema(self, filename: str) -> None:
+        """Execute statements without executescript's implicit transaction commit."""
+        schema = Path(__file__).with_name(filename).read_text(encoding="utf-8")
+        statement = ""
+        for line in schema.splitlines():
+            statement += line + "\n"
+            if sqlite3.complete_statement(statement):
+                self.connection.execute(statement)
+                statement = ""
+
+    def _main_table_exists(self, table: str) -> bool:
+        return (
+            self.connection.execute(
+                "SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?", (table,)
+            ).fetchone()
+            is not None
+        )
+
+    def _migrate_review_notifications(self, version: int) -> None:
+        """Rebuild the v3 outbox atomically, retaining history and safe retry bodies."""
+        if (
+            version >= 4
+            or self.connection.execute(
+                "SELECT 1 FROM review.sqlite_master WHERE type = 'table' AND name = 'email_batches'"
+            ).fetchone()
+            is None
+        ):
+            return
+        from .email_sender import SENDER_EMAIL
+
+        # Renaming both tables retains the old composite foreign key until
+        # their rows have been copied to the freshly constrained pair.
+        self.connection.execute(
+            "ALTER TABLE review.email_batch_items RENAME TO email_batch_items_v3"
+        )
+        self.connection.execute("ALTER TABLE review.email_batches RENAME TO email_batches_v3")
+        self.connection.execute("DROP INDEX IF EXISTS review.email_batches_recipient_status")
+        self._execute_schema("review_schema.sql")
+        self.connection.execute(
+            "INSERT INTO review.email_batches "
+            "(id, recipient, sender, subject, html_body, text_body, status, provider_message_id, "
+            "error, created_at, last_attempt_at, sent_at, attempts) "
+            "SELECT id, recipient, "
+            "CASE WHEN sender = 'flats@spanashis.com' AND status IN ('pending', 'failed') "
+            "THEN ? ELSE sender END, subject, html_body, text_body, status, provider_message_id, "
+            "error, created_at, last_attempt_at, sent_at, attempts FROM review.email_batches_v3",
+            (SENDER_EMAIL,),
+        )
+        self.connection.execute(
+            "INSERT INTO review.email_batch_items (batch_id, recipient, property_id, review_id) "
+            "SELECT batch_id, recipient, property_id, review_id FROM review.email_batch_items_v3"
+        )
+        self.connection.execute("DROP TABLE review.email_batch_items_v3")
+        self.connection.execute("DROP TABLE review.email_batches_v3")
+        if self.connection.execute("PRAGMA review.foreign_key_check").fetchall():
+            raise ValueError("Notification migration left invalid foreign keys")
+
+    def _migrate_legacy_reviews(self, version: int) -> None:
+        """Copy stable legacy IDs, verify conflicts, then remove old main tables."""
+        if self._main_table_exists("review_profiles"):
+            for row in self.connection.execute("SELECT * FROM main.review_profiles").fetchall():
+                backend = row["backend"] if "backend" in dict(row) else "codex"
+                existing = self.connection.execute(
+                    "SELECT * FROM review.review_profiles WHERE profile_key = ?",
+                    (row["profile_key"],),
+                ).fetchone()
+                if existing is not None:
+                    if (existing["criteria"], existing["model"], existing["backend"]) != (
+                        row["criteria"],
+                        row["model"],
+                        backend,
+                    ):
+                        raise ValueError(
+                            "Legacy review profile conflicts with the review database."
+                        )
+                else:
+                    self.connection.execute(
+                        "INSERT INTO review.review_profiles "
+                        "(profile_key, criteria, model, backend, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            row["profile_key"],
+                            row["criteria"],
+                            row["model"],
+                            backend,
+                            row["created_at"],
+                        ),
+                    )
+        if self._main_table_exists("property_reviews"):
+            has_findings = self._main_table_exists("review_findings")
+            has_images = self._main_table_exists("review_images")
+            for row in self.connection.execute("SELECT * FROM main.property_reviews").fetchall():
+                findings = (
+                    [
+                        dict(item)
+                        for item in self.connection.execute(
+                            "SELECT position, criterion, outcome, evidence FROM main.review_findings "
+                            "WHERE review_id = ? ORDER BY position",
+                            (row["id"],),
+                        )
+                    ]
+                    if has_findings
+                    else []
+                )
+                images = (
+                    self.connection.execute(
+                        "SELECT * FROM main.review_images WHERE review_id = ? ORDER BY position",
+                        (row["id"],),
+                    ).fetchall()
+                    if has_images
+                    else []
+                )
+                result = None
+                if row["status"] == "complete" or findings or row["decision"] or row["summary"]:
+                    result = json.dumps(
+                        {
+                            "decision": row["decision"],
+                            "summary": row["summary"],
+                            "findings": findings,
+                            "images_examined": [image["position"] + 1 for image in images],
+                            "legacy_schema_version": version,
+                        },
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    )
+                existing = self.connection.execute(
+                    "SELECT *, json(result) AS result_text FROM review.property_reviews WHERE id = ?",
+                    (row["id"],),
+                ).fetchone()
+                scalar = dict(row)
+                scalar.pop("result", None)
+                scalar.pop("search_id", None)
+                scalar.pop("decision")
+                scalar.pop("summary")
+                if existing is not None:
+                    if any(existing[name] != value for name, value in scalar.items()) or (
+                        (json.loads(existing["result_text"]) if existing["result_text"] else None)
+                        != (json.loads(result) if result else None)
+                    ):
+                        raise ValueError("Legacy review ID conflicts with the review database.")
+                else:
+                    columns = ", ".join(scalar)
+                    values = ", ".join("?" for _ in scalar)
+                    self.connection.execute(
+                        f"INSERT INTO review.property_reviews ({columns}, result) "
+                        f"VALUES ({values}, jsonb(?))",
+                        (*scalar.values(), result),
+                    )
+                for image in images:
+                    image_values = dict(image)
+                    existing_image = self.connection.execute(
+                        "SELECT * FROM review.review_images WHERE review_id = ? AND position = ?",
+                        (image["review_id"], image["position"]),
+                    ).fetchone()
+                    if existing_image is not None:
+                        if dict(existing_image) != image_values:
+                            raise ValueError(
+                                "Legacy review gallery conflicts with the review database."
+                            )
+                    else:
+                        columns = ", ".join(image_values)
+                        values = ", ".join("?" for _ in image_values)
+                        self.connection.execute(
+                            f"INSERT INTO review.review_images ({columns}) VALUES ({values})",
+                            tuple(image_values.values()),
+                        )
+        for table in (
+            "review_digest_items",
+            "review_digests",
+            "review_findings",
+            "review_images",
+            "property_reviews",
+            "review_profiles",
+        ):
+            self.connection.execute(f"DROP TABLE IF EXISTS main.{table}")
 
     def __enter__(self) -> Self:
         return self
@@ -143,6 +372,66 @@ class Database:
         return self.connection.execute(
             "SELECT * FROM properties WHERE id = ?", (property_id,)
         ).fetchone()
+
+    def _delete_properties(self, property_ids: list[int]) -> int:
+        """Delete inside the caller's transaction, retaining all shared image bytes."""
+        if self.connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise ValueError("Property deletion requires enabled foreign keys.")
+        contents = set()
+        deleted = 0
+        for batch in batched(property_ids, 500):
+            placeholders = ",".join("?" for _ in batch)
+            # Reviews can reference old gallery bytes no longer in property_images.
+            contents.update(
+                row[0]
+                for row in self.connection.execute(
+                    "SELECT content_sha256 FROM property_images "
+                    f"WHERE property_id IN ({placeholders}) AND content_sha256 IS NOT NULL "
+                    "UNION SELECT i.sha256 FROM review.review_images i "
+                    "JOIN review.property_reviews r ON r.id = i.review_id "
+                    f"WHERE r.property_id IN ({placeholders})",
+                    (*batch, *batch),
+                )
+            )
+            self.connection.execute(
+                f"DELETE FROM review.property_reviews WHERE property_id IN ({placeholders})", batch
+            )
+            deleted += self.connection.execute(
+                f"DELETE FROM properties WHERE id IN ({placeholders})", batch
+            ).rowcount
+        for batch in batched(contents, 500):
+            placeholders = ",".join("?" for _ in batch)
+            self.connection.execute(
+                f"DELETE FROM image_blobs WHERE sha256 IN ({placeholders}) "
+                "AND NOT EXISTS (SELECT 1 FROM property_images "
+                "WHERE content_sha256 = image_blobs.sha256) "
+                "AND NOT EXISTS (SELECT 1 FROM review.review_images "
+                "WHERE sha256 = image_blobs.sha256)",
+                batch,
+            )
+        return deleted
+
+    def delete_properties(self, property_ids: list[int]) -> int:
+        """Atomically cascade property deletion and clean up their unreferenced BLOBs."""
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            return self._delete_properties(list(dict.fromkeys(property_ids)))
+
+    def filter_properties(self, property_ids: list[int]) -> list[int]:
+        """Evaluate saved facts and atomically delete rejected IDs from this scan only."""
+        property_ids = list(dict.fromkeys(property_ids))
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            passing = list(
+                dict.fromkeys(filtering.filter_property_ids(self.connection, property_ids))
+            )
+            if not set(passing) <= set(property_ids):
+                raise ValueError("Post-filter returned IDs outside the current scan.")
+            keep = set(passing)
+            self._delete_properties(
+                [property_id for property_id in property_ids if property_id not in keep]
+            )
+            return passing
 
     def _upsert_row(
         self,
@@ -189,8 +478,9 @@ class Database:
 
     def upsert_property(self, property: Property) -> bool:
         """Insert or refresh one listing; return True only for a new property ID."""
-        now = _now()
         with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            now = _now()
             existing = self.get_property(property.id)
             values = {column: getattr(property, column) for column in PROPERTY_COLUMNS}
             # SQLite stores booleans as integers, preserving None for unknown facts.
@@ -361,17 +651,32 @@ class Database:
         content_type: str,
         etag: str | None = None,
         last_modified: str | None = None,
+        *,
+        require_association: bool = False,
     ) -> bool:
         """Store actual image bytes, deduplicating content across listings and URLs.
 
         Returns False if this association already points to the same image bytes.
         Download headers belong to the source URL, rather than the shared blob.
+        With require_association, a URL removed during download stays removed.
         """
         if not content:
             raise ValueError("Cannot store an empty image")
         sha256 = hashlib.sha256(content).hexdigest()
         now = _now()
         with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            if self.get_property(property_id) is None:
+                return False  # A concurrent deletion filter may have removed this listing.
+            if (
+                require_association
+                and self.connection.execute(
+                    "SELECT 1 FROM property_images WHERE property_id = ? AND source_url = ?",
+                    (property_id, image.source_url),
+                ).fetchone()
+                is None
+            ):
+                return False
             self._upsert_image(property_id, image, now)
             existing = self.connection.execute(
                 "SELECT * FROM property_images WHERE property_id = ? AND source_url = ?",
@@ -406,6 +711,9 @@ class Database:
     def record_image_error(self, property_id: int, url: str, message: str) -> None:
         now = _now()
         with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            if self.get_property(property_id) is None:
+                return
             # Preserve an already downloaded image if a subsequent request fails.
             self.connection.execute(
                 "INSERT OR IGNORE INTO property_images "
@@ -428,95 +736,6 @@ class Database:
                 },
                 now,
             )
-
-    @staticmethod
-    def search_id_for(params: dict[str, str], location: str) -> str:
-        """Resolve an existing search's stable ID without creating or changing it."""
-        canonical_params = {str(key): str(value) for key, value in sorted(params.items())}
-        canonical = json.dumps(
-            [" ".join(location.split()).casefold(), canonical_params],
-            sort_keys=True,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-    def upsert_search(
-        self,
-        params: dict[str, str],
-        location: str,
-        latitude: float | None = None,
-        longitude: float | None = None,
-    ) -> str:
-        """Return the stable search ID for a location and set of scalar filters."""
-        canonical_params = {str(key): str(value) for key, value in sorted(params.items())}
-        normalized_location = " ".join(location.split())
-        search_id = self.search_id_for(params, location)
-        now = _now()
-        with self.connection:
-            self._upsert_row(
-                "searches",
-                {"id": search_id},
-                {
-                    "location": normalized_location,
-                    "latitude": latitude,
-                    "longitude": longitude,
-                    # A process can be interrupted before finish_search runs.
-                    # Keep the last successful completion timestamp, but never
-                    # describe a newly started execution as already complete.
-                    "last_search_complete": 0,
-                },
-                now,
-                preserve_unknown=True,
-            )
-            self.connection.executemany(
-                "INSERT INTO search_filters (search_id, name, value) VALUES (?, ?, ?) "
-                "ON CONFLICT(search_id, name) DO UPDATE SET value = excluded.value",
-                [(search_id, name, value) for name, value in canonical_params.items()],
-            )
-        return search_id
-
-    def record_match(self, search_id: str, candidate: Candidate) -> None:
-        now = _now()
-        # The importer normally already saved the property, including details.
-        # Standalone callers can pass candidates directly without another step.
-        if self.get_property(candidate.property.id) is None:
-            self.upsert_property(candidate.property)
-        with self.connection:
-            self._upsert_row(
-                "search_matches",
-                {
-                    "search_id": search_id,
-                    "property_id": candidate.property.id,
-                },
-                {
-                    "distance_km": candidate.distance_km,
-                    "commute_minutes": candidate.commute_minutes,
-                    "active": 1,
-                },
-                now,
-                preserve_unknown=True,
-            )
-
-    def finish_search(self, search_id: str, seen_ids: list[int], complete: bool) -> None:
-        """Deactivate missing matches only after a full, successfully imported search."""
-        now = _now()
-        with self.connection:
-            if complete:
-                keep = set(seen_ids)
-                matches = self.connection.execute(
-                    "SELECT property_id FROM search_matches WHERE search_id = ? AND active = 1",
-                    (search_id,),
-                ).fetchall()
-                self.connection.executemany(
-                    "UPDATE search_matches SET active = 0, updated_at = ? "
-                    "WHERE search_id = ? AND property_id = ?",
-                    [(now, search_id, row[0]) for row in matches if row[0] not in keep],
-                )
-            values: dict[str, Any] = {"last_search_complete": int(complete)}
-            if complete:
-                values["last_completed_at"] = now
-            self._upsert_row("searches", {"id": search_id}, values, now)
 
     def counts(self) -> dict[str, int]:
         result = {

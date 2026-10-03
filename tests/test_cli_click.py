@@ -48,8 +48,8 @@ def test_fetch_aliases_and_typed_arguments(captured_scan, tmp_path):
             "1",
             "--max-bedrooms",
             "3",
-            "--max-properties",
-            "7",
+            "--rps",
+            "1.5",
             "--property-type",
             "flat",
             "--property-type",
@@ -71,7 +71,8 @@ def test_fetch_aliases_and_typed_arguments(captured_scan, tmp_path):
     assert args.rent_min == Decimal(1200)
     assert isinstance(args.rent_min, Decimal)
     assert args.rent_max == Decimal("2500.50")
-    assert (args.bedrooms_min, args.bedrooms_max, args.limit) == (1, 3, 7)
+    assert (args.bedrooms_min, args.bedrooms_max) == (1, 3)
+    assert args.requests_per_second == 1.5
     assert tuple(args.property_types) == ("flat", "house")
     assert args.move_in_before == date(2026, 11, 30)
     assert args.db == db
@@ -79,6 +80,13 @@ def test_fetch_aliases_and_typed_arguments(captured_scan, tmp_path):
     assert args.cookie_file == cookie_file
     assert isinstance(args.cookie_file, Path)
     assert not db.exists()
+    api, website = cli.scan_options(args)
+    assert api.location == args.location and api.radius_km == pytest.approx(3.218688)
+    assert website.rent_max == Decimal("2500.50")
+    assert website.property_types == ("flat", "house")
+    assert website.pets is None and website.furnishing is None
+    assert website.include_unavailable is False  # Deliberate CLI default.
+    assert set(api.parameters()) == {"term", "searchType", "area"}
 
 
 @pytest.mark.parametrize(

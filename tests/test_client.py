@@ -13,8 +13,9 @@ from openrent.client import FetchError, OpenRentClient
 
 
 @asynccontextmanager
-async def with_transport(handler, retries=0, **kwargs):
-    client = OpenRentClient(delay=kwargs.pop("delay", 0), retries=retries, **kwargs)
+async def with_transport(handler, **kwargs):
+    kwargs.setdefault("requests_per_second", 1_000_000)
+    client = OpenRentClient(**kwargs)
     headers, cookies, event_hooks = (
         client.http.headers,
         client.http.cookies,
@@ -52,6 +53,51 @@ def test_summary_api_uses_repeated_ids_and_checks_shape():
     asyncio.run(scenario())
 
 
+def test_rate_limit_covers_images_redirects_and_retries():
+    starts = []
+
+    def handler(request):
+        starts.append((request.url.path, time.monotonic()))
+        if request.url.path == "/redirect":
+            return httpx.Response(302, headers={"Location": "/finish"})
+        if request.url.path == "/retry" and sum(path == "/retry" for path, _ in starts) == 1:
+            return httpx.Response(503, headers={"Retry-After": "0"})
+        return httpx.Response(200, content=png_bytes())
+
+    async def scenario():
+        async with with_transport(handler, concurrency=3, requests_per_second=20) as client:
+            await asyncio.gather(
+                client.get("https://www.openrent.co.uk/redirect"),
+                client.get("https://www.openrent.co.uk/retry"),
+                client.image("https://imagescdn.openrent.co.uk/photo.png"),
+            )
+
+    asyncio.run(scenario())
+    assert sorted(path for path, _ in starts) == ["/finish", "/photo.png", "/redirect", "/retry", "/retry"]
+    assert all(later[1] - earlier[1] >= 0.045 for earlier, later in pairwise(starts))
+
+
+def test_cancelled_rate_limit_wait_does_not_block_next_request():
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        return httpx.Response(200)
+
+    async def scenario():
+        async with with_transport(handler, concurrency=1, requests_per_second=20) as client:
+            await client.get("https://www.openrent.co.uk/first")
+            task = asyncio.create_task(client.get("https://www.openrent.co.uk/cancel"))
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.wait_for(client.get("https://www.openrent.co.uk/last"), 2)
+
+    asyncio.run(scenario())
+    assert paths == ["/first", "/last"]
+
+
 def test_image_validates_bytes_and_dimensions():
     data = png_bytes()
 
@@ -86,7 +132,7 @@ def test_permanent_http_error_is_not_retried():
         return httpx.Response(404)
 
     async def scenario():
-        async with with_transport(handler, retries=3) as client:
+        async with with_transport(handler) as client:
             with pytest.raises(FetchError):
                 await client.get("https://www.openrent.co.uk/101")
 
@@ -103,7 +149,7 @@ def test_access_refusal_is_not_retried(status, method):
         return httpx.Response(status)
 
     async def scenario():
-        async with with_transport(handler, retries=3) as client:
+        async with with_transport(handler) as client:
             with pytest.raises(FetchError, match="cookie-file"):
                 await getattr(client, method)("https://www.openrent.co.uk/101")
 
@@ -122,8 +168,8 @@ def test_transient_http_error_retries(monkeypatch):
         pass
 
     async def scenario():
-        async with with_transport(handler, retries=1) as client:
-            monkeypatch.setattr(client, "_backoff", no_backoff)
+        async with with_transport(handler) as client:
+            monkeypatch.setattr("openrent.client.asyncio.sleep", no_backoff)
             assert (await client.get("https://www.openrent.co.uk/101")).text == "okay"
 
     asyncio.run(scenario())
@@ -143,8 +189,8 @@ def test_transport_error_retries(monkeypatch):
         pass
 
     async def scenario():
-        async with with_transport(handler, retries=1) as client:
-            monkeypatch.setattr(client, "_backoff", no_backoff)
+        async with with_transport(handler) as client:
+            monkeypatch.setattr("openrent.client.asyncio.sleep", no_backoff)
             assert (await client.get("https://www.openrent.co.uk/101")).status_code == 200
 
     asyncio.run(scenario())
@@ -174,8 +220,8 @@ def test_image_retry_closes_failed_stream(monkeypatch):
         assert streams[0].closed
 
     async def scenario():
-        async with with_transport(handler, retries=1) as client:
-            monkeypatch.setattr(client, "_backoff", no_backoff)
+        async with with_transport(handler) as client:
+            monkeypatch.setattr("openrent.client.asyncio.sleep", no_backoff)
             assert (await client.image("https://imagescdn.openrent.co.uk/a.png"))[1] == "image/png"
 
     asyncio.run(scenario())
@@ -183,68 +229,10 @@ def test_image_retry_closes_failed_stream(monkeypatch):
     assert all(stream.closed for stream in streams)
 
 
-def test_requests_share_a_concurrency_limit():
-    async def scenario():
-        active = maximum = calls = 0
-        at_capacity, release = asyncio.Event(), asyncio.Event()
-
-        async def handler(request):
-            nonlocal active, maximum, calls
-            calls += 1
-            active += 1
-            maximum = max(maximum, active)
-            if active == 2:
-                at_capacity.set()
-            try:
-                await release.wait()
-                return httpx.Response(200, content=png_bytes())
-            finally:
-                active -= 1
-
-        async with with_transport(handler, concurrency=2) as client:
-            tasks = [
-                asyncio.create_task(client.get(f"https://www.openrent.co.uk/{number}"))
-                for number in range(3)
-            ] + [
-                asyncio.create_task(client.image(f"https://imagescdn.openrent.co.uk/{number}.png"))
-                for number in range(3)
-            ]
-            try:
-                await asyncio.wait_for(at_capacity.wait(), 2)
-                assert calls == active == maximum == 2
-            finally:
-                release.set()
-                await asyncio.gather(*tasks)
-        assert calls == 6
-        assert maximum == 2
-
-    asyncio.run(scenario())
-
-
-def test_request_starts_share_one_pacing_interval():
-    starts = []
-
-    async def handler(request):
-        starts.append(time.monotonic())
-        await asyncio.sleep(0.01)
-        return httpx.Response(200)
-
-    async def scenario():
-        async with with_transport(handler, delay=0.025, concurrency=4) as client:
-            await asyncio.gather(
-                *(client.get(f"https://www.openrent.co.uk/{number}") for number in range(5))
-            )
-
-    asyncio.run(scenario())
-    assert len(starts) == 5
-    assert all(second - first >= 0.023 for first, second in pairwise(starts))
-
-
-def test_redirect_hops_share_the_pacing_interval_with_other_requests():
-    starts, paths = [], []
+def test_redirects_follow_valid_hosts():
+    paths = []
 
     def handler(request):
-        starts.append(time.monotonic())
         paths.append(request.url.path)
         if request.url.path == "/start":
             return httpx.Response(302, headers={"Location": "/intermediate"})
@@ -253,7 +241,7 @@ def test_redirect_hops_share_the_pacing_interval_with_other_requests():
         return httpx.Response(200)
 
     async def scenario():
-        async with with_transport(handler, delay=0.025, concurrency=2) as client:
+        async with with_transport(handler) as client:
             redirected, other = await asyncio.gather(
                 client.get("https://www.openrent.co.uk/start"),
                 client.get("https://www.openrent.co.uk/other"),
@@ -263,7 +251,6 @@ def test_redirect_hops_share_the_pacing_interval_with_other_requests():
 
     asyncio.run(scenario())
     assert sorted(paths) == ["/finish", "/intermediate", "/other", "/start"]
-    assert all(second - first >= 0.023 for first, second in pairwise(starts))
 
 
 def test_refuses_redirects_to_arbitrary_hosts():
@@ -282,78 +269,69 @@ def test_refuses_redirects_to_arbitrary_hosts():
     assert calls == ["www.openrent.co.uk"]
 
 
-def test_retry_after_defers_a_worker_already_waiting_for_pacing():
-    starts = {}
+@pytest.mark.parametrize("method", ["get", "image"])
+@pytest.mark.parametrize("succeeds", [True, False])
+def test_429_retries_with_exponential_backoff(monkeypatch, method, succeeds):
+    calls, waits = [], []
 
-    async def handler(request):
-        starts[request.url.path] = time.monotonic()
-        if request.url.path == "/busy":
-            await asyncio.sleep(0.03)
-            return httpx.Response(429, headers={"Retry-After": "1"})
-        return httpx.Response(200)
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200 if succeeds and len(calls) == 6 else 429, content=png_bytes())
+
+    async def sleep(seconds):
+        waits.append(seconds)
 
     async def scenario():
-        async with with_transport(handler, delay=0.1, concurrency=2) as client:
-            busy, okay = await asyncio.gather(
-                client.get("https://www.openrent.co.uk/busy"),
-                client.get("https://www.openrent.co.uk/okay"),
-                return_exceptions=True,
-            )
-            assert isinstance(busy, FetchError)
-            assert okay.status_code == 200
+        monkeypatch.setattr("openrent.client.asyncio.sleep", sleep)
+        async with with_transport(handler) as client:
+            if succeeds:
+                await getattr(client, method)("https://www.openrent.co.uk/retry")
+            else:
+                with pytest.raises(FetchError):
+                    await getattr(client, method)("https://www.openrent.co.uk/retry")
 
     asyncio.run(scenario())
-    assert starts["/okay"] - starts["/busy"] >= 1.0
+    assert len(calls) == 6
+    assert waits == [30, 60, 120, 240, 300]
 
 
-def test_backoff_releases_network_capacity(monkeypatch):
+@pytest.mark.parametrize("method", ["get", "image"])
+@pytest.mark.parametrize("header,wait", [("61", 61), ("Thu, 01 Jan 1970 00:01:01 GMT", 61), ("invalid", 30)])
+def test_retry_after_only_delays_failed_request(monkeypatch, method, header, wait):
     async def scenario():
-        backoff_started, release = asyncio.Event(), asyncio.Event()
-        calls = []
+        sleeping, release = asyncio.Event(), asyncio.Event()
+        calls, waits = [], []
 
         def handler(request):
             calls.append(request.url.path)
-            return httpx.Response(503 if calls == ["/retry"] else 200)
+            if calls == ["/retry"]:
+                return httpx.Response(429, headers={"Retry-After": header})
+            return httpx.Response(200, content=png_bytes())
 
-        async def backoff(*args):
-            backoff_started.set()
+        async def sleep(seconds):
+            waits.append(seconds)
+            sleeping.set()
             await release.wait()
 
-        async with with_transport(handler, retries=1, concurrency=1) as client:
-            monkeypatch.setattr(client, "_backoff", backoff)
-            retry = asyncio.create_task(client.get("https://www.openrent.co.uk/retry"))
+        monkeypatch.setattr("openrent.client.asyncio.sleep", sleep)
+        monkeypatch.setattr("openrent.client.time.time", lambda: 0)
+        async with with_transport(handler, concurrency=1) as client:
+            retry = asyncio.create_task(getattr(client, method)("https://www.openrent.co.uk/retry"))
             try:
-                await asyncio.wait_for(backoff_started.wait(), 2)
+                await asyncio.wait_for(sleeping.wait(), 2)
                 response = await asyncio.wait_for(client.get("https://www.openrent.co.uk/other"), 2)
                 assert response.status_code == 200
             finally:
                 release.set()
-                assert (await retry).status_code == 200
+                await retry
         assert calls == ["/retry", "/other", "/retry"]
+        assert waits == [wait]
 
     asyncio.run(scenario())
-
-
-def test_long_server_pause_stops_other_workers():
-    calls = []
-
-    def handler(request):
-        calls.append(request.url.path)
-        return httpx.Response(429, headers={"Retry-After": "61"})
-
-    async def scenario():
-        async with with_transport(handler) as client:
-            with pytest.raises(FetchError, match="61s pause"):
-                await client.get("https://www.openrent.co.uk/busy")
-            with pytest.raises(FetchError, match="61s pause"):
-                await client.get("https://www.openrent.co.uk/other")
-
-    asyncio.run(scenario())
-    assert calls == ["/busy"]
 
 
 @pytest.mark.parametrize("method", ["get", "image"])
-def test_cancellation_closes_response_and_releases_capacity(method):
+def test_cancellation_closes_response(method):
     async def scenario():
         streaming = asyncio.Event()
 
@@ -377,7 +355,7 @@ def test_cancellation_closes_response_and_releases_capacity(method):
                 else httpx.Response(200)
             )
 
-        async with with_transport(handler, concurrency=1) as client:
+        async with with_transport(handler) as client:
             task = asyncio.create_task(getattr(client, method)("https://www.openrent.co.uk/cancel"))
             await asyncio.wait_for(streaming.wait(), 2)
             task.cancel()
@@ -413,7 +391,7 @@ def test_oversized_image_closes_response(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_image_verification_does_not_block_the_event_loop_or_network_capacity(monkeypatch):
+def test_image_verification_does_not_block_the_event_loop(monkeypatch):
     verification_started, release = threading.Event(), threading.Event()
 
     def verify(content, url):
@@ -422,9 +400,7 @@ def test_image_verification_does_not_block_the_event_loop_or_network_capacity(mo
         return "image/png", (7, 9)
 
     async def scenario():
-        async with with_transport(
-            lambda _: httpx.Response(200, content=png_bytes()), concurrency=1
-        ) as client:
+        async with with_transport(lambda _: httpx.Response(200, content=png_bytes()), concurrency=2) as client:
             monkeypatch.setattr(client, "_verify_image", verify)
             task = asyncio.create_task(client.image("https://imagescdn.openrent.co.uk/a.png"))
             try:

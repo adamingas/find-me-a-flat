@@ -151,41 +151,6 @@ CREATE TABLE IF NOT EXISTS media_links (
     PRIMARY KEY (property_id, url, kind)
 );
 
--- Searches and their scalar filter parameters are also deduplicated.
--- A repeated execution updates the same search/match rows; there is no run log.
-CREATE TABLE IF NOT EXISTS searches (
-    id TEXT PRIMARY KEY CHECK (length(id) = 64),
-    location TEXT NOT NULL,
-    latitude REAL CHECK (latitude BETWEEN -90 AND 90),
-    longitude REAL CHECK (longitude BETWEEN -180 AND 180),
-    first_seen_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    last_completed_at TEXT,
-    last_search_complete INTEGER NOT NULL DEFAULT 0 CHECK (last_search_complete IN (0, 1))
-);
-
-CREATE TABLE IF NOT EXISTS search_filters (
-    search_id TEXT NOT NULL REFERENCES searches(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    value TEXT NOT NULL,
-    PRIMARY KEY (search_id, name)
-);
-
-CREATE TABLE IF NOT EXISTS search_matches (
-    search_id TEXT NOT NULL REFERENCES searches(id) ON DELETE CASCADE,
-    property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
-    distance_km REAL CHECK (distance_km >= 0),
-    commute_minutes REAL CHECK (commute_minutes >= 0),
-    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
-    first_seen_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (search_id, property_id)
-);
-CREATE INDEX IF NOT EXISTS search_matches_property ON search_matches(property_id);
-CREATE INDEX IF NOT EXISTS search_matches_active ON search_matches(search_id, active);
-
 CREATE VIEW IF NOT EXISTS property_summary AS
 SELECT p.id, p.url, p.title, p.address_display, p.locality, p.postcode,
        p.latitude, p.longitude, p.property_type, p.bedrooms, p.bathrooms,
@@ -198,4 +163,4 @@ SELECT p.id, p.url, p.title, p.address_display, p.locality, p.postcode,
         WHERE i.property_id = p.id AND i.download_status = 'downloaded') AS downloaded_image_count
 FROM properties p;
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 6;

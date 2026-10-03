@@ -19,7 +19,7 @@ uv run openrent export \
   --columns id,url,title,rent_pcm,bedrooms,postcode,nearest_tube_station,nearest_tube_walk_minutes
 ```
 
-`--list-columns` shows the available projection fields. `--search-id` selects one stored search and `--active-only` restricts to its current matches. The daemon's `--export-csv data/victoria.csv` and optional `--export-columns` refresh a CSV for its current search after successful scans. Import this file into Google Sheets using its File → Import menu; this is a local file export, with no automatically configured cloud upload.
+`--list-columns` shows the available projection fields. Export reads the shared listing archive; `--active-only` restricts it to listings disclosed as live. The daemon's `--export-csv data/listings.csv` and optional `--export-columns` refresh all live archived listings after successful scans. Import this file into Google Sheets using File → Import; this is a local file export, with no automatically configured cloud upload.
 
 Useful columns include listing ID and URL, displayed address, postcode, coordinates, monthly rent, bedrooms, bathrooms, available date, furnishing, pets, nearest Tube and rail stations and their walking minutes, main image URL, first/last seen, and current search match. Preserve unknown values as blank. Station names and walking minutes would remain OpenRent's estimates.
 
@@ -29,7 +29,7 @@ For a daemon, use a dedicated service account with access to an existing spreads
 
 1. Create a Google Cloud project and enable the Google Sheets API.
 2. Create a service account and obtain credentials for the machine running the daemon.
-3. Create the spreadsheet in your own Google account and share it with the service account's email as an editor.
+3. Create the spreadsheet in your own Google account and share it with the service account as an editor.
 4. Configure the spreadsheet ID, tab name, and selected columns.
 
 A service account is a separate identity and does not automatically see your spreadsheets; sharing grants access. No domain-wide delegation is needed to edit a spreadsheet directly shared with that account. A library such as `google-auth` with the official Python API client, or `gspread`, handles authentication. Keep credential files outside the repository. See [Google's server-to-server authentication guide](https://developers.google.com/identity/protocols/oauth2/service-account) and [gspread's service-account setup](https://docs.gspread.org/en/latest/oauth2.html#for-bots-using-service-account).
@@ -46,7 +46,7 @@ A small adapter can use the same flat row projection as CSV export:
 2. Batch-write existing listings to their current rows, and allocate rows for new IDs. Writing explicit new-row ranges with `spreadsheets.values.batchUpdate` is easier to retry than blindly appending again after a timeout. Grow the grid when necessary. Allow only one automated writer per tab.
 3. Write only configured managed columns. Leave user columns such as Notes, Contacted, and Viewing date untouched. Unknown managed values use `""` to clear stale cells; API `null` skips a cell rather than clearing it.
 4. Use `valueInputOption=RAW` so source text is never interpreted as a formula. Keep rent numeric for filtering, with conversion from SQLite's integer pence. Encode IDs consistently.
-5. Commit the local scan first, then sync. A Sheets failure must not roll back the archive. Retry transient errors with backoff and retry the projection on a later scheduled run. Successful complete searches can update a `current_match` column; partial or failed searches must not mark old matches inactive.
+5. Commit the local scan first, then sync. A Sheets failure must not roll back the archive. Retry transient errors with backoff and retry the projection on a later scheduled run. Use the listing’s disclosed availability; absence from a scan must not mark a listing unavailable.
 
 This is an implementation proposal. Google provides [batched value writes](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/batchUpdate), [RAW value handling](https://developers.google.com/workspace/sheets/api/guides/values), and the documented distinction between [null and empty-string inputs](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values).
 

@@ -12,7 +12,7 @@ from types import TracebackType
 from typing import Any, Self, TypeVar
 
 from .db import Database
-from .models import Candidate, Image, Property
+from .models import Image, Property
 
 T = TypeVar("T")
 
@@ -161,17 +161,11 @@ class AsyncDatabase:
     async def upsert_property(self, property: Property) -> bool:
         return await self._call("upsert_property", property)
 
-    async def upsert_search(
-        self,
-        params: dict[str, str],
-        location: str,
-        latitude: float | None = None,
-        longitude: float | None = None,
-    ) -> str:
-        return await self._call("upsert_search", params, location, latitude, longitude)
+    async def filter_properties(self, property_ids: list[int]) -> list[int]:
+        return await self._call("filter_properties", property_ids)
 
-    async def record_match(self, search_id: str, candidate: Candidate) -> None:
-        await self._call("record_match", search_id, candidate)
+    async def delete_properties(self, property_ids: list[int]) -> int:
+        return await self._call("delete_properties", property_ids)
 
     async def image_downloaded(self, property_id: int, url: str) -> bool:
         return await self._call("image_downloaded", property_id, url)
@@ -184,6 +178,8 @@ class AsyncDatabase:
         content_type: str,
         etag: str | None = None,
         last_modified: str | None = None,
+        *,
+        require_association: bool = False,
     ) -> bool:
         return await self._call(
             "store_image",
@@ -193,13 +189,11 @@ class AsyncDatabase:
             content_type,
             etag=etag,
             last_modified=last_modified,
+            require_association=require_association,
         )
 
     async def record_image_error(self, property_id: int, url: str, message: str) -> None:
         await self._call("record_image_error", property_id, url, message)
-
-    async def finish_search(self, search_id: str, seen_ids: list[int], complete: bool) -> None:
-        await self._call("finish_search", search_id, seen_ids, complete=complete)
 
     async def counts(self) -> dict[str, int]:
         return await self._call("counts")

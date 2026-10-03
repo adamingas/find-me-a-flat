@@ -10,7 +10,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from .db import PROPERTY_COLUMNS
+from .db import PROPERTY_COLUMNS, review_path_for
 
 DEFAULT_COLUMNS = (
     "id",
@@ -75,8 +75,6 @@ for _mode, _kind in (("tube", "underground"), ("rail", "national_rail")):
     _EXPRESSIONS[f"nearest_{_mode}_station"] = _nearest(_kind, "name")
     _EXPRESSIONS[f"nearest_{_mode}_walk_minutes"] = _nearest(_kind, "walking_minutes")
 
-# These values are meaningful only relative to a specific search location.
-_EXPRESSIONS.update(distance_km="NULL", commute_minutes="NULL", search_active="NULL")
 EXPORT_COLUMNS = tuple(dict.fromkeys((*DEFAULT_COLUMNS, *_EXPRESSIONS)))
 _MONEY_COLUMNS = {"rent_pcm", "rent_weekly", "deposit"}
 
@@ -106,9 +104,15 @@ def validate_destination(db_path: Path, output: Path) -> None:
     db_path = Path(db_path).resolve()
     output = Path(output)
     resolved_output = output.resolve()
+    review_path = review_path_for(db_path)
     protected = (
-        db_path,
-        *(Path(str(db_path) + suffix) for suffix in ("-wal", "-shm", "-journal", ".scan.lock")),
+        *(
+            Path(str(database) + suffix)
+            for database in (db_path, review_path)
+            for suffix in ("", "-wal", "-shm", "-journal")
+        ),
+        Path(str(db_path) + ".scan.lock"),
+        Path(str(db_path) + ".review.scan.lock"),
     )
     for path in protected:
         if resolved_output == path.resolve() or (
@@ -123,15 +127,11 @@ def export_csv(
     db_path: Path,
     output: Path,
     columns: list[str] | None = None,
-    search_id: str | None = None,
     active_only: bool = False,
 ) -> int:
     """Atomically replace a UTF-8 CSV with one row per property, sorted by ID.
 
-    ``search_id`` restricts rows to that search's matches and supplies distance,
-    commute time, and match activity. Without it, these three columns are blank.
-    ``active_only`` uses match activity for a selected search, or the listing's
-    disclosed ``is_live`` flag otherwise. No database schema or data is changed.
+    ``active_only`` selects listings disclosed as live. Reads the shared archive.
 
     Listing text with spreadsheet-formula prefixes receives a leading literal
     apostrophe. Image columns contain source URLs and counts, never image bytes.
@@ -149,25 +149,10 @@ def export_csv(
     output = Path(output)
     validate_destination(db_path, output)
 
-    expressions = _EXPRESSIONS.copy()
-    parameters: list[Any] = []
-    source = "properties p"
-    conditions = []
-    if search_id is not None:
-        source += " JOIN search_matches m ON m.property_id = p.id"
-        conditions.append("m.search_id = ?")
-        parameters.append(search_id)
-        expressions.update(
-            distance_km="m.distance_km",
-            commute_minutes="m.commute_minutes",
-            search_active="m.active",
-        )
+    projection = ", ".join(f'{_EXPRESSIONS[name]} AS "{name}"' for name in selected)
+    query = f"SELECT {projection} FROM properties p"
     if active_only:
-        conditions.append("m.active = 1" if search_id is not None else "p.is_live = 1")
-    projection = ", ".join(f'{expressions[name]} AS "{name}"' for name in selected)
-    query = f"SELECT {projection} FROM {source}"
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
+        query += " WHERE p.is_live = 1"
     query += " ORDER BY p.id"
 
     temporary: Path | None = None
@@ -175,11 +160,7 @@ def export_csv(
         # URI mode=ro also fails for missing files instead of creating an empty
         # SQLite archive. Do not use immutable mode: a daemon may have fresh WAL data.
         with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True, timeout=30)) as db:
-            if search_id is not None:
-                exists = db.execute("SELECT 1 FROM searches WHERE id = ?", (search_id,)).fetchone()
-                if exists is None:
-                    raise ValueError(f"Unknown search ID: {search_id}")
-            cursor = db.execute(query, parameters)
+            cursor = db.execute(query)
             output.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
                 mode="w",

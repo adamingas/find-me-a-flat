@@ -6,7 +6,7 @@ from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from openrent.db import Database
-from openrent.models import Candidate, Feature, Image, Property
+from openrent.models import Feature, Image, Property
 
 scalar = st.one_of(
     st.none(),
@@ -46,7 +46,6 @@ def test_identical_snapshots_are_idempotent_and_changed_listings_update_existing
     }
     all_contents = {content for _, _, _, content, _ in records}
     with Database(":memory:") as db:
-        search_id = db.upsert_search({"prices_max": "1000000", "area": "2"}, "Victoria, London")
         first_seen = {}
         current_snapshots = {}
 
@@ -89,12 +88,10 @@ def test_identical_snapshots_are_idempotent_and_changed_listings_update_existing
             if kind:
                 assert feature[f"value_{kind}"] == value
 
-            db.record_match(search_id, Candidate(prop, distance_km=1))
             for picture in pictures:
                 db.store_image(property_id, picture, content, "image/jpeg")
             current_snapshots[property_id] = (prop, content)
 
-        db.finish_search(search_id, list(expected), complete=True)
         first_counts = db.counts()
         current_rows = {
             row["id"]: {key: value for key, value in dict(row).items() if key != "last_seen_at"}
@@ -103,27 +100,20 @@ def test_identical_snapshots_are_idempotent_and_changed_listings_update_existing
 
         # Replay the current snapshot, rather than an old sequence of different
         # prices. Only the observation timestamp may refresh on unchanged data.
-        assert (
-            db.upsert_search({"prices_max": "1000000", "area": "2"}, "  Victoria,   London  ")
-            == search_id
-        )
         for property_id, (prop, content) in current_snapshots.items():
             assert db.upsert_property(prop) is False
             row = db.get_property(property_id)
             assert {
                 key: value for key, value in dict(row).items() if key != "last_seen_at"
             } == current_rows[property_id]
-            db.record_match(search_id, Candidate(prop, distance_km=1))
             for picture in prop.images:
                 assert db.store_image(property_id, picture, content, "image/jpeg") is False
-        db.finish_search(search_id, list(expected), complete=True)
 
         assert db.counts() == first_counts
         assert first_counts["properties"] == len(expected)
-        assert first_counts["property_features"] == first_counts["search_matches"] == len(expected)
+        assert first_counts["property_features"] == len(expected)
         assert first_counts["downloaded_images"] == 2 * len(expected)
         assert first_counts["image_blobs"] == len(all_contents)
-        assert first_counts["searches"] == 1
 
         for property_id, (rent, description, content, _) in expected.items():
             row = db.get_property(property_id)

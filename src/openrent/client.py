@@ -1,16 +1,19 @@
-"""Bounded asynchronous requests to OpenRent and its public summary API."""
+"""Asynchronous requests to OpenRent and its public summary API."""
 
 import asyncio
 import http.cookiejar
 import io
+import logging
 import math
 import time
 from email.utils import parsedate_to_datetime
+from functools import wraps
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 from PIL import Image as PILImage
+from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt
 
 BASE_URL = "https://www.openrent.co.uk"
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
@@ -20,30 +23,74 @@ class FetchError(RuntimeError):
     """A page or photo could not be fetched without losing integrity."""
 
 
+def retry_wait(state):
+    response = getattr(state.outcome.exception(), "response", None)
+    if response is not None and response.headers.get("Retry-After"):
+        value = response.headers["Retry-After"]
+        try:
+            seconds = float(value)
+        except ValueError:
+            try:
+                seconds = parsedate_to_datetime(value).timestamp() - time.time()
+            except (ValueError, TypeError, OverflowError):
+                seconds = float("nan")
+        if math.isfinite(seconds) and seconds >= 0:
+            return seconds
+    limited = response is not None and response.status_code == 429
+    return min((30 if limited else 1) * 2 ** (state.attempt_number - 1), 300 if limited else 30)
+
+
+def retry_request(operation):
+    @wraps(operation)
+    async def attempt(self, url, *args, **kwargs):
+        async with self._slots:
+            return await operation(self, url, *args, **kwargs)
+
+    retrying = retry(
+        retry=retry_if_exception(
+            lambda exc: isinstance(exc, httpx.TransportError)
+            or isinstance(exc, httpx.HTTPStatusError)
+            and (exc.response.status_code == 429 or exc.response.status_code >= 500)
+        ),
+        stop=stop_after_attempt(6),
+        wait=retry_wait,
+        sleep=lambda seconds: asyncio.sleep(seconds),
+        before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
+        reraise=True,
+    )(attempt)
+
+    @wraps(operation)
+    async def wrapped(self, url, *args, **kwargs):
+        try:
+            return await retrying(self, url, *args, **kwargs)
+        except httpx.HTTPError as exc:
+            response = getattr(exc, "response", None)
+            detail = ""
+            if response is not None and response.status_code == 405 and response.is_stream_consumed:
+                detail = f"\n405 response (Allow: {response.headers.get('Allow', 'missing')}): {response.text[:2000]}"
+            raise FetchError(f"Could not fetch {url}: {exc}{detail}") from exc
+
+    return wrapped
+
+
 class OpenRentClient:
     def __init__(
         self,
-        delay: float = 0.5,
         timeout: float = 30.0,
-        retries: int = 3,
+        concurrency: int = 1,
+        requests_per_second: float = 0.2,
         cookie_file: Path | None = None,
-        concurrency: int = 4,
     ):
-        if (
-            not math.isfinite(delay)
-            or delay < 0
-            or not isinstance(retries, int)
-            or retries < 0
-            or not isinstance(concurrency, int)
-            or concurrency < 1
-        ):
-            raise ValueError("Delay and retries must be nonnegative; concurrency must be positive.")
-        self.delay, self.retries = delay, retries
-        self._last_request = 0.0
-        self._cooldown_until = 0.0
-        self._server_pause_error = None
-        self._pace_lock = asyncio.Lock()
-        self._requests = asyncio.Semaphore(concurrency)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Timeout must be positive.")
+        if concurrency < 1:
+            raise ValueError("Concurrency must be positive.")
+        if not math.isfinite(requests_per_second) or requests_per_second <= 0:
+            raise ValueError("Requests per second must be positive and finite.")
+        self._slots = asyncio.Semaphore(concurrency)
+        self._rate_lock = asyncio.Lock()
+        self._interval = 1 / requests_per_second
+        self._next_request_at = 0.0
         cookies = None
         if cookie_file:
             cookies = http.cookiejar.MozillaCookieJar(str(cookie_file))
@@ -71,55 +118,13 @@ class OpenRentClient:
         await self.http.__aexit__(*args)
 
     async def _on_request(self, request):
-        # HTTPX also invokes request hooks for redirect hops. The semaphore still
-        # covers the whole attempt, while each actual request reserves a start.
+        # Count every HTTP attempt, including redirects and retries.
         self._check_url(str(request.url))
-        await self._pace()
-
-    async def _pace(self):
-        """Reserve a request start, sharing its interval and server cooldown."""
-        async with self._pace_lock:
-            while True:
-                if self._server_pause_error:
-                    raise FetchError(self._server_pause_error)
-                now = time.monotonic()
-                wait = max(self._last_request + self.delay, self._cooldown_until) - now
-                if wait <= 0:
-                    self._last_request = now
-                    return
-                # Recheck after sleeping: a different response can extend the cooldown.
+        async with self._rate_lock:
+            wait = self._next_request_at - time.monotonic()
+            if wait > 0:
                 await asyncio.sleep(wait)
-
-    def _retry_wait(self, attempt, response=None):
-        wait = min(2**attempt, 30)
-        retry_after = None
-        if response is not None and response.headers.get("Retry-After"):
-            value = response.headers["Retry-After"]
-            try:
-                retry_after = float(value)
-            except ValueError:
-                try:
-                    retry_after = parsedate_to_datetime(value).timestamp() - time.time()
-                except (ValueError, TypeError, OverflowError):
-                    pass
-            if retry_after is not None and math.isfinite(retry_after):
-                wait = max(wait, retry_after)
-            else:
-                retry_after = None
-        if wait > 60:
-            self._server_pause_error = (
-                f"Server requested a {wait:.0f}s pause. Retry the command later."
-            )
-            raise FetchError(self._server_pause_error)
-        if retry_after is not None:
-            # No await between reading and writing: other tasks observe the cooldown
-            # immediately, including a task already sleeping inside _pace.
-            self._cooldown_until = max(self._cooldown_until, time.monotonic() + wait)
-        return wait
-
-    async def _backoff(self, attempt, response=None):
-        wait = self._retry_wait(attempt, response)
-        await asyncio.sleep(wait)
+            self._next_request_at = time.monotonic() + self._interval
 
     @staticmethod
     def _check_url(url):
@@ -138,35 +143,17 @@ class OpenRentClient:
                 "If needed, supply your own exported session with --cookie-file."
             )
 
-    @staticmethod
-    def _retryable(exc):
-        return isinstance(exc, httpx.TransportError) or (
-            exc.response.status_code == 429 or exc.response.status_code >= 500
-        )
-
+    @retry_request
     async def get(self, url, params=None, headers=None) -> httpx.Response:
         self._check_url(url)
-        for attempt in range(self.retries + 1):
-            response = None
-            try:
-                async with self._requests:
-                    response = await self.http.get(url, params=params, headers=headers)
-                    self._check_access(response)
-                    if (response.status_code == 429 or response.status_code >= 500) and (
-                        response.headers.get("Retry-After")
-                    ):
-                        self._retry_wait(attempt, response)
-                    response.raise_for_status()
-                    return response
-            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
-                if self._retryable(exc) and attempt < self.retries:
-                    if response is not None:
-                        await response.aclose()
-                    # The semaphore is released before any retry delay.
-                    await self._backoff(attempt, response)
-                    continue
-                raise FetchError(f"Could not fetch {url}: {exc}") from exc
-        raise FetchError(f"Request failed: {url}")
+        response = await self.http.get(url, params=params, headers=headers)
+        self._check_access(response)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            await response.aclose()
+            raise
+        return response
 
     async def search(self, params):
         return await self.get(BASE_URL + "/search/search_bycommutetime", params=params)
@@ -202,34 +189,20 @@ class OpenRentClient:
             raise FetchError(f"Source returned an invalid image: {url}") from exc
         return mime, dimensions
 
+    @retry_request
     async def image(self, url):
         """Stream and verify photos, rejecting error pages and oversized downloads."""
         self._check_url(url)
-        for attempt in range(self.retries + 1):
-            response = None
-            try:
-                async with self._requests, self.http.stream("GET", url) as response:
-                    self._check_access(response)
-                    if (response.status_code == 429 or response.status_code >= 500) and (
-                        response.headers.get("Retry-After")
-                    ):
-                        # Publish before stream cleanup can yield to another worker.
-                        self._retry_wait(attempt, response)
-                    response.raise_for_status()
-                    chunks, size = [], 0
-                    async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        if size > MAX_IMAGE_BYTES:
-                            raise FetchError("Image exceeds the 25 MiB download limit.")
-                        chunks.append(chunk)
-                    content = b"".join(chunks)
-                    headers = response.headers
-                # Pillow verification runs off the event loop, after closing the stream.
-                mime, dimensions = await asyncio.to_thread(self._verify_image, content, url)
-                return content, mime, dimensions, headers
-            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
-                if self._retryable(exc) and attempt < self.retries:
-                    await self._backoff(attempt, response)
-                    continue
-                raise FetchError(f"Could not download image {url}: {exc}") from exc
-        raise FetchError(f"Image download failed: {url}")
+        async with self.http.stream("GET", url) as response:
+            self._check_access(response)
+            response.raise_for_status()
+            chunks, size = [], 0
+            async for chunk in response.aiter_bytes():
+                size += len(chunk)
+                if size > MAX_IMAGE_BYTES:
+                    raise FetchError("Image exceeds the 25 MiB download limit.")
+                chunks.append(chunk)
+            content = b"".join(chunks)
+            headers = response.headers
+        mime, dimensions = await asyncio.to_thread(self._verify_image, content, url)
+        return content, mime, dimensions, headers
