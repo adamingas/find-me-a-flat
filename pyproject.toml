@@ -1,0 +1,35 @@
+[project]
+name = "openrent-fetch"
+version = "0.1.0"
+description = "Import OpenRent rental listings and full-size photographs into SQLite."
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.13,<5",
+    "click>=8.1,<9",
+    "croniter>=6,<7",
+    "httpx>=0.28,<1",
+    "pillow>=11,<13",
+]
+
+[project.scripts]
+openrent = "openrent.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openrent"]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6,<7",
+    "pytest>=8,<10",
+    "ruff>=0.13,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
