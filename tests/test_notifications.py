@@ -14,8 +14,7 @@ from test_review import add_listing, config, judgement
 from openrent import cli, notifications, review
 from openrent.email_sender import (
     SENDER_EMAIL,
-    CloudflareEmailConfig,
-    CloudflareEmailSender,
+    ResendEmailConfig,
     ResendEmailSender,
 )
 from openrent.review_db import ReviewDatabase
@@ -36,22 +35,14 @@ def notify_args(path, *recipients):
         db=path,
         email_to=recipients,
         email_preview=None,
-        email_provider="cloudflare",
         env_file=None,
-        cloudflare_account_id="test-account",
         email_timeout=1,
         quiet=True,
     )
 
 
 def accepted(recipient):
-    return httpx.Response(
-        200,
-        json={
-            "success": True,
-            "result": {"queued": [recipient], "message_id": "test-provider-message"},
-        },
-    )
+    return httpx.Response(200, json={"id": "49a3999c-0ce1-4ea6-ab68-afcd6dc2e794"})
 
 
 def test_bounded_review_finishes_entire_cohort_before_emailing_pass_and_uncertain(
@@ -62,7 +53,7 @@ def test_bounded_review_finishes_entire_cohort_before_emailing_pass_and_uncertai
         add_listing(path, property_id)
     saved_review(path, 99)  # An earlier unemailed pass lies outside the chosen cohort.
     recipient = "self@example.com"
-    provider = CloudflareEmailConfig("test-account", "test-placeholder", timeout=1)
+    provider = ResendEmailConfig("test-placeholder", timeout=1)
     cfg = replace(
         config(path),
         concurrency=2,
@@ -88,11 +79,11 @@ def test_bounded_review_finishes_entire_cohort_before_emailing_pass_and_uncertai
 
     async def post(request):
         assert request.method == "POST"
-        assert str(request.url).endswith("/accounts/test-account/email/sending/send")
+        assert str(request.url) == "https://api.resend.com/emails"
         payload = json.loads(request.content)
         requests.append(payload)
         assert payload["from"] == SENDER_EMAIL == "notifications@flats.spanashis.com"
-        assert payload["to"] == recipient
+        assert payload["to"] == [recipient]
         assert payload["subject"] == "2 new flats found"
         for body in (payload["html"], payload["text"]):
             assert "https://www.openrent.co.uk/2" in body
@@ -129,14 +120,12 @@ def test_bounded_review_finishes_entire_cohort_before_emailing_pass_and_uncertai
         return accepted(recipient)
 
     monkeypatch.setattr(review, "judge_property", judge)
-    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "test-placeholder")
-
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(post)) as client:
             monkeypatch.setattr(
                 notifications,
-                "CloudflareEmailSender",
-                lambda configuration: CloudflareEmailSender(configuration, client=client),
+                "ResendEmailSender",
+                lambda configuration: ResendEmailSender(configuration, client=client),
             )
             assert await review.process_pending(cfg, quiet=True) == 0
 
@@ -149,7 +138,7 @@ def test_bounded_review_finishes_entire_cohort_before_emailing_pass_and_uncertai
         assert (batch["status"], batch["attempts"], batch["provider_message_id"]) == (
             "sent",
             1,
-            "test-provider-message",
+            "49a3999c-0ce1-4ea6-ab68-afcd6dc2e794",
         )
         assert [
             tuple(row)
@@ -166,7 +155,7 @@ def test_failed_review_and_empty_initial_cohort_do_not_send_or_reserve_email(tmp
     empty_path = tmp_path / "old-backlog.sqlite"
     saved_review(empty_path, 99)
     recipient = "self@example.com"
-    provider = CloudflareEmailConfig("test-account", "test-placeholder", timeout=1)
+    provider = ResendEmailConfig("test-placeholder", timeout=1)
     notification_config = notifications.NotificationConfig((recipient,), provider)
     judged = []
 
@@ -180,7 +169,7 @@ def test_failed_review_and_empty_initial_cohort_do_not_send_or_reserve_email(tmp
         raise AssertionError("An incomplete or empty review cycle must not start an email sender")
 
     monkeypatch.setattr(review, "judge_property", judge)
-    monkeypatch.setattr(notifications, "CloudflareEmailSender", forbidden)
+    monkeypatch.setattr(notifications, "ResendEmailSender", forbidden)
     cfg = replace(config(failed_path), notifications=notification_config)
     assert asyncio.run(review.process_pending(cfg, quiet=True)) == 1
     assert sorted(judged) == [1, 2, 3]
@@ -209,12 +198,10 @@ def test_recipient_isolation_frozen_retry_and_unknown_delivery_are_not_resent(
     phase = "reject"
     requests = []
     cancellation_started = asyncio.Event()
-    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "test-placeholder")
-
     async def post(request):
         payload = json.loads(request.content)
         requests.append(payload)
-        recipient = payload["to"]
+        recipient = payload["to"][0]
         assert "https://www.openrent.co.uk/2" not in payload["html"]
         if recipient == first and phase == "reject":
             return httpx.Response(400, json={"success": False})
@@ -230,11 +217,11 @@ def test_recipient_isolation_frozen_retry_and_unknown_delivery_are_not_resent(
         async with httpx.AsyncClient(transport=httpx.MockTransport(post)) as client:
             monkeypatch.setattr(
                 notifications,
-                "CloudflareEmailSender",
-                lambda configuration: CloudflareEmailSender(configuration, client=client),
+                "ResendEmailSender",
+                lambda configuration: ResendEmailSender(configuration, client=client),
             )
             assert await notifications.notify_command(notify_args(path, first.upper(), second)) == 1
-            assert [item["to"] for item in requests] == [first, second]
+            assert [item["to"] for item in requests] == [[first], [second]]
             assert requests[0]["html"] == requests[1]["html"]
             assert requests[0]["subject"] == "2 new flats found"
             assert "https://www.openrent.co.uk/3" in requests[0]["html"]
@@ -246,7 +233,7 @@ def test_recipient_isolation_frozen_retry_and_unknown_delivery_are_not_resent(
             phase = "accept"
             assert await notifications.notify_command(notify_args(path, first, second)) == 0
             assert requests[2] == requests[0]
-            assert [item["to"] for item in requests[2:]] == [first, first, second]
+            assert [item["to"] for item in requests[2:]] == [[first], [first], [second]]
             for payload in requests[3:]:
                 assert payload["subject"] == "1 new flats found"
                 assert "https://www.openrent.co.uk/4" in payload["html"]
@@ -309,8 +296,6 @@ def test_cli_preview_needs_no_credentials_preserves_state_and_validates_options(
     criteria = tmp_path / "conditions.txt"
     criteria.write_text("My suitability conditions", encoding="utf-8")
     for name in (
-        "CLOUDFLARE_ACCOUNT_ID",
-        "CLOUDFLARE_API_TOKEN",
         "RESEND_TOKEN",
         "OPENAI_API_KEY",
         "OPENRENT_REVIEW_MODEL",
@@ -320,11 +305,10 @@ def test_cli_preview_needs_no_credentials_preserves_state_and_validates_options(
     def forbidden(*args, **kwargs):
         raise AssertionError("Preview and notify must not start a sender or model")
 
-    monkeypatch.setattr(notifications, "CloudflareEmailSender", forbidden)
     monkeypatch.setattr(notifications, "ResendEmailSender", forbidden)
     monkeypatch.setattr(review, "judge_property", forbidden)
     runner = CliRunner()
-    base = ["notify", "--db", str(path), "--email-provider", "cloudflare"]
+    base = ["notify", "--db", str(path)]
     flags = ["--email-to", recipient, "--email-preview", str(preview)]
     result = runner.invoke(cli.app, [*base, *flags])
     assert result.exit_code == 0, result.output
@@ -339,8 +323,6 @@ def test_cli_preview_needs_no_credentials_preserves_state_and_validates_options(
         assert db.counts()["email_batches"] == db.counts()["email_batch_items"] == 0
         assert len(db.pending_notifications(recipient)) == 2
     result = runner.invoke(cli.app, [*base, "--email-to", recipient])
-    assert result.exit_code == 1 and "CLOUDFLARE_API_TOKEN" in result.output
-    result = runner.invoke(cli.app, ["notify", "--db", str(path), "--email-to", recipient])
     assert result.exit_code == 1 and "RESEND_TOKEN" in result.output
     result = runner.invoke(cli.app, [*base, "--email-preview", str(preview)])
     assert result.exit_code == 1 and "at least one --email-to" in result.output

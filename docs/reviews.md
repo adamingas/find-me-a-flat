@@ -166,9 +166,8 @@ missing gallery images and waits for every selected assessment to finish before 
 concise digest per recipient. An unbounded cycle covers all live, unprocessed IDs, including
 new arrivals; `--review-limit N` restricts it to at most N selected properties. Include their
 **passed and uncertain** results that have not already been emailed to that recipient;
-exclude rejected flats. The sender is `notifications@flats.spanashis.com`.
-**Resend is the default email provider**; choose Cloudflare explicitly with
-`--email-provider cloudflare`.
+exclude rejected flats. The sender is `notifications@flats.spanashis.com` and delivery uses
+Resend.
 
 If there are no live, unprocessed property IDs, the automatic cycle exits without an email.
 If any selected image download or assessment fails or remains incomplete, its property stays
@@ -244,47 +243,8 @@ uv run openrent notify --db data/victoria.sqlite \
   --env-file .env --email-to adamingas@gmail.com
 ```
 
-`--email-provider resend` is accepted explicitly, but is the default. Use `--email-preview FILE`
-to inspect the body without sending. `--email-timeout` sets the sending timeout in seconds
-(default 30).
-
-### Optional Cloudflare provider
-
-Choose `--email-provider cloudflare` to use Cloudflare instead. Account and token settings are
-required for sending through this provider: set
-`CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`, or pass the account ID with
-`--cloudflare-account-id`. For `notifications@flats.spanashis.com` to your own inbox, **a paid
-plan is not required**. Cloudflare permits direct REST sends to account-verified destination
-addresses
-free on any plan, including when only Email Routing is configured. Set up that free path:
-
-1. Configure `flats.spanashis.com` as an Email Routing domain, using Cloudflare DNS. Open the
-   `spanashis.com` zone's Email Routing Settings and add `flats` under Subdomains, following
-   [Cloudflare's subdomain setup](https://developers.cloudflare.com/email-service/configuration/subdomains/).
-   The sender must belong to that configured routing domain.
-2. In the Cloudflare dashboard, go to **Compute → Email Service → Email Routing → Destination
-   Addresses**. Add `adamingas@gmail.com` and open Cloudflare's verification email to activate
-   the address. This is a setup requirement; the application does not verify your inbox.
-3. Create an API token with **Email Sending: Edit** permission for the same Cloudflare account.
-   Supply it through `CLOUDFLARE_API_TOKEN` and supply that account's ID through
-   `CLOUDFLARE_ACCOUNT_ID`.
-
-See [destination verification](https://developers.cloudflare.com/email-service/configuration/email-routing-addresses/)
-and [sender-domain rules](https://developers.cloudflare.com/email-service/platform/limits/).
-Sends to verified destinations do not consume monthly or daily sending quotas. For additional
-CLI recipients, verify each destination first to retain the free path. Sending to arbitrary
-unverified recipients requires the Workers Paid plan and an onboarded sending domain;
-see [Cloudflare pricing](https://developers.cloudflare.com/email-service/platform/pricing/)
-and [sending-domain setup](https://developers.cloudflare.com/email-service/get-started/send-emails/).
-
-The application uses the [REST API](https://developers.cloudflare.com/email-service/api/send-emails/rest-api/)
-directly; no Worker deployment is needed. The API token is read from the environment, never a
-CLI flag. `--email-timeout` sets the sending timeout in seconds (default 30).
-
-```sh
-uv run openrent notify --db data/victoria.sqlite \
-  --email-provider cloudflare --email-to adamingas@gmail.com
-```
+Use `--email-preview FILE` to inspect the body without sending. `--email-timeout` sets the
+sending timeout in seconds (default 30).
 
 ### Delivery tracking
 

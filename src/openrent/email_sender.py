@@ -10,7 +10,6 @@ from uuid import UUID
 import httpx
 
 SENDER_EMAIL = "notifications@flats.spanashis.com"
-_ACCOUNT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _RECIPIENT = re.compile(
     r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
     r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\Z"
@@ -23,25 +22,6 @@ class EmailSendError(RuntimeError):
 
 class EmailSendIndeterminate(EmailSendError):
     """The request may have been accepted; retrying could send duplicate email."""
-
-
-@dataclass(frozen=True, slots=True)
-class CloudflareEmailConfig:
-    account_id: str
-    api_token: str = field(repr=False)
-    timeout: float = 30
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.account_id, str) or not _ACCOUNT_ID.fullmatch(self.account_id):
-            raise ValueError("Cloudflare account ID must be a nonempty identifier.")
-        if (
-            not isinstance(self.api_token, str)
-            or not self.api_token.strip()
-            or any(ord(character) <= 32 or ord(character) == 127 for character in self.api_token)
-        ):
-            raise ValueError("Cloudflare API token must be nonempty and contain no whitespace.")
-        if not math.isfinite(self.timeout) or self.timeout <= 0:
-            raise ValueError("Cloudflare email timeout must be a positive finite number.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,107 +79,6 @@ def _validate_message(recipient: str, subject: str, html: str, text: str) -> Non
         raise ValueError("Email subject must be nonempty and contain no control characters.")
     if not isinstance(html, str) or not isinstance(text, str) or not (html or text):
         raise ValueError("Email needs HTML or plain text content.")
-
-
-class CloudflareEmailSender:
-    """Send one digest to one recipient, without automatic POST retries.
-
-    Cloudflare's documented sending endpoint has no idempotency-key contract.
-    Network failures and unclear responses therefore remain indeterminate.
-    Callers should retain those attempts until their outcome is reconciled.
-    """
-
-    def __init__(
-        self, config: CloudflareEmailConfig, *, client: httpx.AsyncClient | None = None
-    ) -> None:
-        self.config = config
-        self._client = client
-
-    async def send(self, recipient: str, subject: str, html: str, text: str) -> SendReceipt:
-        _validate_message(recipient, subject, html, text)
-        payload = {
-            "from": SENDER_EMAIL,
-            "to": recipient,
-            "subject": subject,
-            "html": html,
-            "text": text,
-        }
-        if self._client is not None:
-            return await self._send(self._client, recipient, payload)
-        async with httpx.AsyncClient(follow_redirects=False) as client:
-            return await self._send(client, recipient, payload)
-
-    async def _send(
-        self, client: httpx.AsyncClient, recipient: str, payload: dict[str, str]
-    ) -> SendReceipt:
-        url = (
-            "https://api.cloudflare.com/client/v4/accounts/"
-            f"{self.config.account_id}/email/sending/send"
-        )
-        try:
-            response = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {self.config.api_token}"},
-                json=payload,
-                timeout=self.config.timeout,
-                follow_redirects=False,
-            )
-        except httpx.RequestError:
-            raise EmailSendIndeterminate(
-                "Cloudflare email delivery status is unknown after a network failure; "
-                "the request was not retried."
-            ) from None
-
-        # Never include response bodies or underlying exceptions: these can contain secrets.
-        if 400 <= response.status_code < 500:
-            raise EmailSendError(
-                f"Cloudflare rejected the email request (HTTP {response.status_code})."
-            )
-        if not 200 <= response.status_code < 300:
-            raise EmailSendIndeterminate(
-                f"Cloudflare returned HTTP {response.status_code}; email acceptance is unknown."
-            )
-        try:
-            body = response.json()
-        except ValueError:
-            raise EmailSendIndeterminate(
-                "Cloudflare returned an unreadable email receipt."
-            ) from None
-        if not isinstance(body, dict):
-            raise EmailSendIndeterminate("Cloudflare returned an invalid email receipt.")
-        if body.get("success") is False:
-            raise EmailSendError("Cloudflare rejected the email request.")
-        result = body.get("result")
-        if body.get("success") is not True or not isinstance(result, dict):
-            raise EmailSendIndeterminate("Cloudflare did not confirm email acceptance.")
-
-        statuses: dict[str, set[str]] = {}
-        for name in ("delivered", "queued", "permanent_bounces", "suppressed_recipients"):
-            addresses = result.get(name, [])
-            if not isinstance(addresses, list) or any(
-                not isinstance(item, str) for item in addresses
-            ):
-                raise EmailSendIndeterminate(
-                    "Cloudflare returned invalid recipient delivery statuses."
-                )
-            statuses[name] = {item.casefold() for item in addresses}
-        address = recipient.casefold()
-        accepted = address in statuses["delivered"] or address in statuses["queued"]
-        rejected = (
-            address in statuses["permanent_bounces"] or address in statuses["suppressed_recipients"]
-        )
-        if accepted == rejected:
-            raise EmailSendIndeterminate(
-                "Cloudflare did not unambiguously report this recipient's status."
-            )
-        message_id = result.get("message_id")
-        if message_id is not None and (
-            not isinstance(message_id, str)
-            or not message_id
-            or any(ord(character) < 32 or ord(character) == 127 for character in message_id)
-        ):
-            raise EmailSendIndeterminate("Cloudflare returned an invalid provider message ID.")
-        return SendReceipt(provider_message_id=message_id, accepted=accepted)
 
 
 class ResendEmailSender:

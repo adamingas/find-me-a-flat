@@ -139,7 +139,7 @@ Keep the process and host running to maintain scanning. The command runs in the 
 
 ## Selected-field CSV export
 
-Export any supported field subset for Google Sheets, Excel, or another system that imports tables:
+Export any supported field subset to a CSV file:
 
 ```sh
 uv run openrent export \
@@ -157,8 +157,6 @@ Exports use a read-only database connection and atomically replace the CSV with 
 Export reads the shared archive. `--active-only` selects listings currently disclosed as live. Distances and commute times from a search centre are used during filtering but are not stored as listing facts; station walking times and property coordinates remain available.
 
 For the daemon, `--export-csv FILE` refreshes all live archived listings after a successful scan. `--export-columns id,url,rent_pcm,...` selects a subset. Failed scans/exports preserve the previous CSV. Limited scans can export the pool accumulated so far; `--dry-run` cannot export. Give concurrently running daemons different output filenames when you need separate files.
-
-Google Sheets can import the CSV immediately using File → Import. Automatic API synchronization is feasible with a service account or OAuth credentials, a target spreadsheet, and property-ID-based row updates. [The integration assessment](google-sheets.md) covers authentication, preserving manual Notes columns, retries, quotas, and image previews. An authenticated Sheets writer is a future extension; CSV export is implemented now, and this project does not upload to or modify any cloud spreadsheet.
 
 ## Stored data
 

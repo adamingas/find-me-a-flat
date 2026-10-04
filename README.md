@@ -73,6 +73,5 @@ a live end-to-end check.
 
 - [Flags, cron scheduling, CSV export, storage and source coverage](docs/reference.md)
 - [Review backends, output schema, email previews/retries and SQL queries](docs/reviews.md)
-- [Google Sheets integration options](docs/google-sheets.md)
 
 Use `uv run openrent COMMAND --help` for all options.

@@ -12,8 +12,6 @@ from dotenv import dotenv_values
 
 from .email_digest import DigestListing, render_digest
 from .email_sender import (
-    CloudflareEmailConfig,
-    CloudflareEmailSender,
     EmailSendError,
     EmailSendIndeterminate,
     ResendEmailConfig,
@@ -28,7 +26,7 @@ from .review_db import AsyncReviewDatabase
 @dataclass(frozen=True)
 class NotificationConfig:
     recipients: tuple[str, ...]
-    provider: ResendEmailConfig | CloudflareEmailConfig | None = None
+    provider: ResendEmailConfig | None = None
     preview: Path | None = None
 
 
@@ -63,25 +61,10 @@ def configuration(args) -> NotificationConfig | None:
     settings = dict(dotenv_values(env_file)) if env_file.is_file() else {}
     settings.update(os.environ)
     timeout = getattr(args, "email_timeout", 30)
-    provider_name = getattr(args, "email_provider", "resend")
-    if provider_name == "resend":
-        token = settings.get("RESEND_TOKEN") or ""
-        if not token:
-            raise ValueError("Email sending needs RESEND_TOKEN in the environment or env file.")
-        return NotificationConfig(recipients, provider=ResendEmailConfig(token, timeout=timeout))
-    if provider_name != "cloudflare":
-        raise ValueError("Email provider must be resend or cloudflare.")
-    account_id = getattr(args, "cloudflare_account_id", None) or settings.get(
-        "CLOUDFLARE_ACCOUNT_ID", ""
-    )
-    token = settings.get("CLOUDFLARE_API_TOKEN") or ""
-    if not account_id or not token:
-        raise ValueError(
-            "Email sending needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN "
-            "(or --cloudflare-account-id for the account ID)."
-        )
-    provider = CloudflareEmailConfig(account_id, token, timeout=timeout)
-    return NotificationConfig(recipients, provider=provider)
+    token = settings.get("RESEND_TOKEN") or ""
+    if not token:
+        raise ValueError("Email sending needs RESEND_TOKEN in the environment or env file.")
+    return NotificationConfig(recipients, provider=ResendEmailConfig(token, timeout=timeout))
 
 
 async def send_pending(
@@ -110,11 +93,7 @@ async def send_pending(
         return 0
     if config.provider is None:
         raise ValueError("Email provider configuration is required for sending email.")
-    use_resend = isinstance(config.provider, ResendEmailConfig)
-    provider_name = "Resend" if use_resend else "Cloudflare"
-    sender = (
-        ResendEmailSender(config.provider) if use_resend else CloudflareEmailSender(config.provider)
-    )
+    sender = ResendEmailSender(config.provider)
     failures = 0
     for recipient in config.recipients:
         # Retry an explicitly failed request with its saved content. A previous
@@ -144,13 +123,12 @@ async def send_pending(
             if not await db.mark_email_sending(batch["id"]):
                 raise ValueError("Email batch could not be claimed for sending.")
             try:
-                send_options = {"idempotency_key": _batch_key(batch)} if use_resend else {}
                 receipt = await sender.send(
                     recipient,
                     batch["subject"],
                     batch["html_body"],
                     batch["text_body"],
-                    **send_options,
+                    idempotency_key=_batch_key(batch),
                 )
             except asyncio.CancelledError:
                 await db.fail_email_batch(
@@ -170,13 +148,13 @@ async def send_pending(
             if not receipt.accepted:
                 await db.fail_email_batch(
                     batch["id"],
-                    f"{provider_name} reported the recipient bounced or was suppressed.",
+                    "Resend reported the recipient bounced or was suppressed.",
                 )
-                report(f"{provider_name} did not accept the email for {recipient}.")
+                report(f"Resend did not accept the email for {recipient}.")
                 failures += 1
                 break
             await db.finish_email_batch(batch["id"], receipt.provider_message_id)
-            report(f"{provider_name} accepted email to {recipient}: {batch['subject']}.")
+            report(f"Resend accepted email to {recipient}: {batch['subject']}.")
             # A saved retry can predate additional eligible reviews. Send those
             # in a fresh batch after this one has been recorded successfully.
     return int(bool(failures))

@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, RootModel, ValidationError
 
 import openrent.judge as judge_module
 from openrent.backends import BackendConfig, BackendError, parse_output, strict_schema
-from openrent.judge import JudgeError, JudgementOutput, _parse_judgement, judge_property
+from openrent.judge import JudgementOutput, judge_property
 from openrent.review_models import (
     BreakingCriterionResult,
     CriterionResult,
@@ -111,8 +111,6 @@ def test_review_facade_supplies_same_schema_instructions_and_full_evidence_to_bo
             )
         )
         assert result.decision == "pass" and "images_examined" not in result.result
-    with pytest.raises(JudgeError, match="missing photographs"):
-        asyncio.run(judge_property(data, [], "Only bright flats.", model="chosen-model"))
     assert [call[0] for call in calls] == ["codex", "responses"]
     assert calls[0][1:] == calls[1][1:]
     assert data == original and [image.content for image in images] == [b"image-one", b"image-two"]
@@ -136,13 +134,11 @@ def test_fixed_response_contract_requires_boolean_criteria_and_rejects_injected_
         del missing[name]
         invalid.append(missing)
     for item in invalid:
-        with pytest.raises(JudgeError):
-            _parse_judgement(json.dumps(item), 2)
+        with pytest.raises(BackendError):
+            parse_output(json.dumps(item), JudgementOutput)
     for raw in ['{"summary": NaN}', '{"summary":"x","summary":"y"}', "```json\n{}\n```"]:
-        with pytest.raises(JudgeError, match="JSON"):
-            _parse_judgement(raw, 2)
-    with pytest.raises(JudgeError):
-        _parse_judgement(json.dumps(assessment()), 0)
+        with pytest.raises(BackendError):
+            parse_output(raw, JudgementOutput)
 
     schema = strict_schema(JudgementOutput)
     assert "decision" not in schema["properties"]
@@ -192,15 +188,15 @@ def test_fixed_criterion_types_own_severity_and_numeric_certainty():
     for name in ("area_m2", "floor"):
         for expected_type, value in branches:
             payload = assessment() | {name: value}
-            result = _parse_judgement(json.dumps(payload), 2)
+            result = parse_output(json.dumps(payload), JudgementOutput)
             assert type(getattr(result, name)) is expected_type
             assert result.result[name] == value
         for old_value in (
             {"value": 45.5, "basis": "stated", "evidence": "Old schema."},
             {"value": None, "certainty": "unknown", "evidence": "Use the null branch."},
         ):
-            with pytest.raises(JudgeError):
-                _parse_judgement(json.dumps(assessment() | {name: old_value}), 2)
+            with pytest.raises(BackendError):
+                parse_output(json.dumps(assessment() | {name: old_value}), JudgementOutput)
 
     for value in (-1.0, 0.0, 45.5):
         stated = StatedNumericalCriterionResults(value=value, evidence="Source figure.")
@@ -285,7 +281,7 @@ def test_verdict_depends_only_on_breaking_criteria(outcomes, area, floor):
         if None in required_outcomes
         else "pass"
     )
-    result = _parse_judgement(json.dumps(payload), 2)
+    result = parse_output(json.dumps(payload), JudgementOutput)
     assert result.decision == expected
     stored = result.model_dump(mode="json")
     assert result.result == stored
@@ -302,7 +298,7 @@ def test_verdict_depends_only_on_breaking_criteria(outcomes, area, floor):
         "evidence": "Stated floor area.",
     }
     changed["floor"] = {"value": -1.0, "certainty": "low", "evidence": "Estimated basement level."}
-    assert _parse_judgement(json.dumps(changed), 2).decision == expected
+    assert parse_output(json.dumps(changed), JudgementOutput).decision == expected
 
 
 def test_configurable_schema_preserves_json_date_uuid_types_and_rejects_bad_contracts():

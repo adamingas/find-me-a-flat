@@ -172,21 +172,9 @@ def email_flags(command):
             ),
         ),
         click.option(
-            "--email-provider",
-            type=click.Choice(["resend", "cloudflare"]),
-            default="resend",
-            show_default=True,
-            help="Email sending service; Resend reads RESEND_TOKEN.",
-        ),
-        click.option(
             "--env-file",
             type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
             help="Read email credentials from this file; uses .env if present.",
-        ),
-        click.option(
-            "--cloudflare-account-id",
-            envvar="CLOUDFLARE_ACCOUNT_ID",
-            help="Cloudflare account ID; token comes from CLOUDFLARE_API_TOKEN.",
         ),
         click.option("--email-timeout", type=float, default=30, show_default=True),
     ]
