@@ -2,7 +2,6 @@
 
 import asyncio
 import copy
-import csv
 from types import SimpleNamespace
 
 import pytest
@@ -339,11 +338,10 @@ def test_dry_run_does_not_create_database(fake_source, tmp_path):
     assert not path.exists()
 
 
-def test_post_filter_prunes_saved_listings_before_daemon_export_and_can_be_disabled(
+def test_post_filter_prunes_saved_listings_in_daemon_and_can_be_disabled(
     fake_source, tmp_path
 ):
     path = tmp_path / "archive.sqlite"
-    output = tmp_path / "listings.csv"
     original = fake_source.search.candidates[0]
     fake_source.search.candidates = []
     for property_id, station, epc_rating in (
@@ -385,10 +383,6 @@ def test_post_filter_prunes_saved_listings_before_daemon_export_and_can_be_disab
                 "--db",
                 str(path),
                 "--filter",
-                "--export-csv",
-                str(output),
-                "--export-columns",
-                "id",
                 "--quiet",
             ]
         )
@@ -400,9 +394,6 @@ def test_post_filter_prunes_saved_listings_before_daemon_export_and_can_be_disab
         ] == [101, 999]
         assert db.counts()["downloaded_images"] == db.counts()["image_blobs"] == 1
         assert not db.connection.execute("PRAGMA foreign_key_check").fetchall()
-    with output.open(newline="") as stream:
-        assert list(csv.DictReader(stream)) == [{"id": "101"}]
-
     # Re-fetching without the filter restores previously deleted IDs.
     assert run_import(path, "--no-filter") == 0
     assert fake_source.image_calls == 11

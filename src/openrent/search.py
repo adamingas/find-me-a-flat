@@ -2,8 +2,9 @@
 
 import math
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from .models import Candidate, SearchData
 
@@ -83,6 +84,7 @@ class WebsiteFilters:
     video: bool | None = None
     no_shared: bool | None = None
     no_studios: bool | None = None
+    today: bool | None = None
     include_unavailable: bool | None = None
     move_in_before: date | None = None
     max_minimum_tenancy: int | None = None
@@ -103,7 +105,12 @@ class WebsiteFilters:
 
 
 def matches_criteria(
-    api: ApiFilters, website: WebsiteFilters, candidate: Candidate, search: SearchData
+    api: ApiFilters,
+    website: WebsiteFilters,
+    candidate: Candidate,
+    search: SearchData,
+    *,
+    reference_date: date | None = None,
 ) -> bool:
     """Check all requested facts before rejecting, so missing source data stays visible."""
     prop, checks = candidate.property, []
@@ -172,6 +179,16 @@ def matches_criteria(
             raise SearchError(
                 f"Property {prop.id} has invalid available_from; cannot evaluate --move-in-before."
             ) from exc
+    if website.today:
+        value = require(prop.first_listed_at, "first_listed_at", "--today")
+        try:
+            listed_date = datetime.fromisoformat(value).astimezone(ZoneInfo("Europe/London")).date()
+        except ValueError as exc:
+            raise SearchError(
+                f"Property {prop.id} has invalid first_listed_at; cannot evaluate --today."
+            ) from exc
+        today = reference_date or datetime.now(ZoneInfo("Europe/London")).date()
+        checks.append(listed_date == today)
     if api.radius_minutes is not None:
         if candidate.commute_minutes is None:
             raise SearchError(

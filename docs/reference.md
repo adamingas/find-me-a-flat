@@ -61,6 +61,7 @@ OpenRent's travel-time search is [London-only and combines train, Tube, and walk
 | `--video` | Video tour or video viewings accepted |
 | `--no-shared`, `--no-studios` | Exclude shared rooms or studios |
 | `--move-in-before YYYY-MM-DD` | Available on or before that date |
+| `--today` | Only listings first listed today, using the Europe/London calendar |
 | `--max-minimum-tenancy MONTHS` | Required minimum tenancy must be at most this many months |
 | `--include-unavailable` | Include unavailable listings returned in the search data |
 | `--sort distance/rent-asc/rent-desc/newest` | Local ordering; newest uses the first-listed timestamp |
@@ -97,7 +98,7 @@ uv run openrent fetch \
   --db data/victoria.sqlite --filter
 ```
 
-The Python function `filter_property_ids(connection, property_ids)` in [filtering.py](../src/openrent/filtering.py) reads saved metadata and returns the passing IDs. Edit that function to add hard-coded rules; its SQLite connection exposes every stored column and related table. It runs on the database worker after listings and their image downloads have been saved, before CSV export or scheduled model review. It only examines successfully imported IDs from the current scan; unrelated archived listings are left alone.
+The Python function `filter_property_ids(connection, property_ids)` in [filtering.py](../src/openrent/filtering.py) reads saved metadata and returns the passing IDs. Edit that function to add hard-coded rules; its SQLite connection exposes every stored column and related table. It runs on the database worker after listings and their image downloads have been saved, before scheduled model review. It only examines successfully imported IDs from the current scan; unrelated archived listings are left alone.
 
 Rejected listings are physically deleted, with cascading deletion of features, nearby places, media links, image associations and reviews. Their image BLOBs are removed only when no remaining listing or review references them. Rule evaluation and deletion use one transaction, so a filter or cleanup failure rolls back the pruning. Review profiles remain. The final scan report includes the number deleted.
 
@@ -114,8 +115,7 @@ uv run openrent daemon \
   --location "Victoria Station, London" \
   --radius-minutes 15 \
   --rent-max 2500 --bedrooms-min 1 --bedrooms-max 2 \
-  --db data/victoria.sqlite \
-  --export-csv data/victoria.csv
+  --db data/victoria.sqlite
 ```
 
 This example scans at minutes 0, 15, 30 and 45 of each hour. The five fields are **minute, hour, day-of-month, month, day-of-week**. Examples: `0 * * * *` hourly, `0 9,18 * * *` at 09:00 and 18:00, or `*/30 8-22 * * mon-fri` every half hour from 08:00 through 22:30 on weekdays. The default timezone is `Europe/London`; another IANA timezone can be supplied explicitly. There is no preset location, radius, rent, or cron schedule.
@@ -129,34 +129,13 @@ uv run openrent daemon \
   --check-schedule
 ```
 
-The daemon awaits scans and uses nonblocking async waits between scheduled times. Each daemon runs its own scans sequentially, while requests within each scan run concurrently. Scheduled ticks that elapse during a scan are skipped, so a slow scan never creates a queue or overlaps the next one. Scan and export errors are logged and the daemon continues on the next tick. Ctrl+C or SIGTERM cancels the current scan, joins its request tasks, closes clients and database handles, and preserves already committed properties/images. Already submitted SQLite writes and atomic CSV exports finish before shutdown. A graceful daemon shutdown returns 0; a bounded daemon run returns 1 if any attempt failed. As before, repeated scans update the same listing IDs and reuse downloaded images.
+The daemon awaits scans and uses nonblocking async waits between scheduled times. Each daemon runs its own scans sequentially, while requests within each scan run concurrently. Scheduled ticks that elapse during a scan are skipped, so a slow scan never creates a queue or overlaps the next one. Scan errors are logged and the daemon continues on the next tick. Ctrl+C or SIGTERM cancels the current scan, joins its request tasks, closes clients and database handles, and preserves already committed properties/images. Already submitted SQLite writes finish before shutdown. A graceful daemon shutdown returns 0; a bounded daemon run returns 1 if any attempt failed. As before, repeated scans update the same listing IDs and reuse downloaded images.
 
-Multiple manual scans or daemons can write to the same database concurrently. SQLite serializes short write transactions; network fetching continues in parallel. Overlapping listings update the same OpenRent ID. Searches, filter settings and match histories are not stored. CSV export uses a read-only SQLite snapshot while ingestion continues.
+Multiple manual scans or daemons can write to the same database concurrently. SQLite serializes short write transactions; network fetching continues in parallel. Overlapping listings update the same OpenRent ID. Searches, filter settings and match histories are not stored.
 
 Cron supports ordinary numeric values, comma lists, ascending ranges, positive steps, and three-letter month/day names. Sunday is 0 or 7. When both day-of-month and day-of-week are restricted, either match triggers a scan. Six/seven-field cron, macros such as `@hourly`, and extensions such as `L`, `W`, `#`, `?`, `H`, and `R` are rejected. During London's spring clock change, nonexistent local scheduled times are skipped. During the autumn change, matching times in the repeated hour can run once in each occurrence.
 
 Keep the process and host running to maintain scanning. The command runs in the foreground and does not install an OS cron entry, launch agent, system service, or Codex automation. A terminal session or your existing process supervisor can keep it alive; after restarting, it resumes at the next future tick rather than replaying historical scans.
-
-## Selected-field CSV export
-
-Export any supported field subset to a CSV file:
-
-```sh
-uv run openrent export \
-  --db data/victoria.sqlite \
-  --output data/victoria.csv \
-  --columns id,url,title,postcode,rent_pcm,bedrooms,nearest_tube_station,nearest_tube_walk_minutes,nearest_rail_station,nearest_rail_walk_minutes
-
-uv run openrent export --list-columns
-```
-
-The default subset includes 17 fields: ID, URL, title, displayed address, postcode, monthly rent, bedrooms, bathrooms, available date, coordinates, nearest Tube and rail names and walking minutes, first photo URL, and status. Rent aliases `rent_pcm`, `rent_weekly`, and `deposit` are exact pounds with two decimals; the original `*_pence` fields are also available. Station fields rank OpenRent's supplied nearby stations by walking minutes. Image fields contain source URLs/counts, with the original image bytes staying in SQLite.
-
-Exports use a read-only database connection and atomically replace the CSV with one row per property, sorted by ID. They never append duplicate rows. Listing text that could be interpreted as a spreadsheet formula is escaped as literal text. Errors preserve the previous output file. Database files, SQLite sidecars, and scan lock files cannot be used as the CSV destination.
-
-Export reads the shared archive. `--active-only` selects listings currently disclosed as live. Distances and commute times from a search centre are used during filtering but are not stored as listing facts; station walking times and property coordinates remain available.
-
-For the daemon, `--export-csv FILE` refreshes all live archived listings after a successful scan. `--export-columns id,url,rent_pcm,...` selects a subset. Failed scans/exports preserve the previous CSV. Limited scans can export the pool accumulated so far; `--dry-run` cannot export. Give concurrently running daemons different output filenames when you need separate files.
 
 ## Stored data
 

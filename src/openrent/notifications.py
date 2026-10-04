@@ -10,6 +10,7 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from .db import review_path_for
 from .email_digest import DigestListing, render_digest
 from .email_sender import (
     EmailSendError,
@@ -18,7 +19,6 @@ from .email_sender import (
     ResendEmailSender,
     validate_recipient,
 )
-from .export import validate_destination
 from .locking import ScanLock
 from .review_db import AsyncReviewDatabase
 
@@ -28,6 +28,30 @@ class NotificationConfig:
     recipients: tuple[str, ...]
     provider: ResendEmailConfig | None = None
     preview: Path | None = None
+
+
+def _validate_preview_destination(db_path: Path, output: Path) -> None:
+    """Reject email previews that would overwrite an archive or its working files."""
+    db_path = Path(db_path).resolve()
+    output = Path(output)
+    resolved_output = output.resolve()
+    review_path = review_path_for(db_path)
+    protected = (
+        *(
+            Path(str(database) + suffix)
+            for database in (db_path, review_path)
+            for suffix in ("", "-wal", "-shm", "-journal")
+        ),
+        Path(str(db_path) + ".scan.lock"),
+        Path(str(db_path) + ".review.scan.lock"),
+    )
+    for path in protected:
+        if resolved_output == path.resolve() or (
+            output.exists() and path.exists() and os.path.samefile(output, path)
+        ):
+            raise ValueError(
+                "Email preview must not overwrite the SQLite database, its sidecars, or scan lock."
+            )
 
 
 def configuration(args) -> NotificationConfig | None:
@@ -47,7 +71,7 @@ def configuration(args) -> NotificationConfig | None:
         if len(recipients) != 1:
             raise ValueError("An --email-preview file requires exactly one --email-to recipient.")
         preview = Path(preview)
-        validate_destination(args.db, preview)
+        _validate_preview_destination(args.db, preview)
         criteria_file = getattr(args, "criteria_file", None)
         if criteria_file is not None and preview.resolve() == Path(criteria_file).resolve():
             raise ValueError("Email preview must not overwrite the criteria file.")

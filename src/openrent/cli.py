@@ -1,11 +1,11 @@
 """uv-run command line interface and resilient, repeatable import orchestration."""
 
 import asyncio
-import math
 import sqlite3
 import sys
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from functools import wraps
 from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,6 +80,7 @@ def scan_flags(command):
         ("video", "Video tour or video viewings accepted."),
         ("no-shared", "Exclude rooms in shared homes."),
         ("no-studios", "Exclude studio flats."),
+        ("today", "Only listings first listed today (Europe/London)."),
         ("include-unavailable", "Also import unavailable listings returned by the search."),
     ):
         options.append(
@@ -143,13 +144,6 @@ def scan_flags(command):
     for option in reversed(options):
         command = option(command)
     return command
-
-
-def column_names(value):
-    columns = [column.strip() for column in value.split(",")]
-    if not all(columns) or len(columns) != len(set(columns)):
-        raise ValueError("Use unique, non-empty comma-separated column names.")
-    return columns
 
 
 def email_flags(command):
@@ -241,18 +235,10 @@ def log(args, message):
 
 def scan_options(args):
     """Validate before opening a client or entering the daemon loop."""
-    if getattr(args, "post_filter", False) and args.dry_run:
+    if args.post_filter and args.dry_run:
         raise SearchError("--filter requires saved detail metadata; omit --dry-run.")
-    if not 1 <= args.concurrency <= 32:
-        raise SearchError("--concurrency must be between 1 and 32.")
-    if not math.isfinite(args.timeout) or args.timeout <= 0:
-        raise SearchError("Use --timeout > 0.")
-    if not math.isfinite(args.requests_per_second) or args.requests_per_second <= 0:
-        raise SearchError("Use --requests-per-second > 0 with a finite value.")
-    if not args.location or (args.radius_distance is None) == (args.radius_minutes is None):
-        raise SearchError(
-            "Supply --location and exactly one of --radius-distance or --radius-minutes."
-        )
+    if args.radius_distance is None and args.radius_minutes is None:
+        raise SearchError("Choose exactly one of --radius-distance or --radius-minutes.")
     values = vars(args) | {"property_types": args.property_types or None}
     return tuple(
         model(**{name: values[name] for name in model.__dataclass_fields__})
@@ -293,7 +279,9 @@ async def fetch(args):
         candidates = [
             candidate
             for candidate in search.candidates
-            if matches_criteria(api, website, candidate, search)
+            if matches_criteria(
+                api, website, candidate, search, reference_date=reference_date
+            )
         ]
         if args.sort == "rent-asc":
             candidates.sort(key=lambda c: c.property.rent_pcm_pence or 0)
@@ -365,7 +353,9 @@ async def fetch(args):
                     if args.no_source_html:
                         prop.source_html = None
                     current = Candidate(prop, candidate.distance_km, candidate.commute_minutes)
-                    matches = matches_criteria(api, website, current, search)
+                    matches = matches_criteria(
+                        api, website, current, search, reference_date=reference_date
+                    )
                 except (FetchError, ValueError) as exc:
                     errors += 1
                     log(args, f"{candidate.property.id}: {exc}")
@@ -398,14 +388,12 @@ async def fetch(args):
                 load_group(candidates[start : start + 20])
                 for start in range(0, len(candidates), 20)
             )
-            if getattr(args, "post_filter", False):
+            if args.post_filter:
                 kept = await db.filter_properties(seen)
                 filtered_out = len(seen) - len(kept)
                 log(args, f"Post-filter kept {len(kept)} listings; deleted {filtered_out}.")
             counts = await db.counts()
-        filter_summary = (
-            f"Post-filter deleted {filtered_out}. " if getattr(args, "post_filter", False) else ""
-        )
+        filter_summary = f"Post-filter deleted {filtered_out}. " if args.post_filter else ""
         print(
             f"Imported {imported} properties ({new_properties} new); downloaded {downloaded} images; "
             f"{errors} errors. {filter_summary}Database: {args.db.resolve()} "
@@ -416,32 +404,18 @@ async def fetch(args):
 
 
 async def daemon(args):
-    from .daemon import run_daemon, validate_schedule
-    from .export import available_columns, export_csv, validate_destination
+    from .daemon import run_daemon
 
     scan_options(args)
-    validate_schedule(args.cron, args.timezone)
-    if args.max_runs is not None and args.max_runs <= 0:
-        raise SearchError("--max-runs must be positive.")
-    if args.export_columns and not args.export_csv:
-        raise SearchError("--export-columns requires --export-csv.")
-    if args.export_columns:
-        unknown = set(args.export_columns) - set(available_columns())
-        if unknown:
-            raise SearchError(f"Unknown export columns: {', '.join(sorted(unknown))}")
-    if args.export_csv:
-        validate_destination(args.db, args.export_csv)
-    if args.export_csv and args.dry_run:
-        raise SearchError("--export-csv cannot be combined with --dry-run.")
 
     review_config = None
     if (
-        (getattr(args, "email_to", ()) or getattr(args, "email_preview", None))
-        and getattr(args, "criteria_file", None) is None
+        (args.email_to or args.email_preview)
+        and args.criteria_file is None
         and not args.check_schedule
     ):
         raise SearchError("Daemon email delivery requires --criteria-file to enable review.")
-    if getattr(args, "criteria_file", None) is not None and not args.check_schedule:
+    if args.criteria_file is not None and not args.check_schedule:
         from .review import configuration
 
         if args.skip_images:
@@ -450,23 +424,6 @@ async def daemon(args):
 
     async def scan(scan_args):
         result = await fetch(scan_args)
-        if result == 0 and args.export_csv:
-            export = asyncio.create_task(
-                asyncio.to_thread(
-                    export_csv,
-                    args.db,
-                    args.export_csv,
-                    columns=args.export_columns,
-                    active_only=True,
-                )
-            )
-            try:
-                rows = await asyncio.shield(export)
-            except asyncio.CancelledError:
-                # Finish atomic replacement even when stopping during export.
-                await export
-                raise
-            log(args, f"Exported {rows} live archived listings to {args.export_csv.resolve()}.")
         if result == 0 and review_config is not None and not args.dry_run:
             from .review import process_pending
 
@@ -476,63 +433,27 @@ async def daemon(args):
     return await run_daemon(args, scan)
 
 
-def _dispatch(args):
-    """Run an already parsed command, keeping scanning separate from Click."""
-    if args.command == "fetch":
-        return asyncio.run(fetch(args))
-    if args.command == "daemon":
-        return asyncio.run(daemon(args))
-    if args.command == "review":
-        from .review import review_command
-
-        return asyncio.run(review_command(args))
-    if args.command == "notify":
-        from .notifications import notify_command
-
-        return asyncio.run(notify_command(args))
-    if args.command == "export":
-        from .export import available_columns, export_csv
-
-        if args.list_columns:
-            click.echo("\n".join(available_columns()))
-            return 0
-        if args.output is None:
-            raise SearchError("export requires --output unless --list-columns is used.")
-        count = export_csv(args.db, args.output, args.columns, args.active_only)
-        click.echo(f"Exported {count} properties to {args.output.resolve()}.")
-        return 0
-    if args.command == "schema":
-        click.echo(files("openrent").joinpath("schema.sql").read_text())
-    else:
-        if not args.db.is_file():
-            raise SearchError(f"Database does not exist: {args.db}")
-        from .review_db import ReviewDatabase
-
-        with ReviewDatabase(args.db) as db:
-            for key, value in db.counts().items():
-                click.echo(f"{key}: {value}")
-    return 0
-
-
 class InterruptedScan(click.ClickException):
     exit_code = 130
 
 
-def _invoke(command, parameters):
-    if command in {"fetch", "daemon"} and (
-        (parameters["radius_distance"] is None) == (parameters["radius_minutes"] is None)
-    ):
-        raise click.UsageError("Choose exactly one of --radius-distance or --radius-minutes.")
-    args = SimpleNamespace(command=command, **parameters)
-    try:
-        result = _dispatch(args)
-    except (FetchError, SearchError, ValueError, sqlite3.Error, OSError) as exc:
-        raise click.ClickException(str(exc)) from exc
-    except KeyboardInterrupt as exc:
-        raise InterruptedScan(
-            "Interrupted; saved properties and images can be resumed with the same command."
-        ) from exc
-    click.get_current_context().exit(result)
+def _invoke(command):
+    """Run a Click callback with shared async execution and error reporting."""
+    @wraps(command)
+    def invoke(**parameters):
+        try:
+            result = command(SimpleNamespace(**parameters))
+            if asyncio.iscoroutine(result):
+                result = asyncio.run(result)
+        except (FetchError, ValueError, sqlite3.Error, OSError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        except KeyboardInterrupt as exc:
+            raise InterruptedScan(
+                "Interrupted; saved properties and images can be resumed with the same command."
+            ) from exc
+        click.get_current_context().exit(result or 0)
+
+    return invoke
 
 
 @click.group(name="openrent", context_settings={"help_option_names": ["--help", "-h"]})
@@ -542,9 +463,10 @@ def app():
 
 @app.command("fetch")
 @scan_flags
-def fetch_command(**parameters):
+@_invoke
+def fetch_command(args):
     """Search and import listings with all listing images."""
-    _invoke("fetch", parameters)
+    return fetch(args)
 
 
 @app.command("daemon")
@@ -557,19 +479,10 @@ def fetch_command(**parameters):
 @click.option(
     "--check-schedule", is_flag=True, help="Print the next five run times without scanning."
 )
-@click.option(
-    "--export-csv",
-    type=click.Path(path_type=Path),
-    help="Refresh a CSV of live archived listings after successful scans.",
-)
-@click.option(
-    "--export-columns",
-    type=column_names,
-    help="Comma-separated CSV fields; use export --list-columns to inspect.",
-)
-def daemon_command(**parameters):
+@_invoke
+def daemon_command(args):
     """Run repeated scans on a five-field cron schedule."""
-    _invoke("daemon", parameters)
+    return daemon(args)
 
 
 @app.command("review")
@@ -586,7 +499,8 @@ def daemon_command(**parameters):
 @click.option("--run-now", is_flag=True)
 @click.option("--max-runs", type=click.IntRange(min=1))
 @click.option("--check-schedule", is_flag=True)
-def review_command_cli(**parameters):
+@_invoke
+def review_command_cli(args):
     """Review live unprocessed properties once with the Agents SDK.
 
     Download missing archived gallery images before judging. By default, include
@@ -595,20 +509,26 @@ def review_command_cli(**parameters):
     With --email-to, bundle passed/uncertain flats after every selected review
     completes. An empty queue or incomplete selected batch sends no email.
     """
-    _invoke("review", parameters)
+    from .review import review_command
+
+    return review_command(args)
 
 
 @app.command("notify")
 @email_flags
 @click.option("--db", type=click.Path(path_type=Path), default=Path("openrent.sqlite"))
 @click.option("--quiet", is_flag=True)
-def notify_command_cli(**parameters):
+@_invoke
+def notify_command_cli(args):
     """Send or preview unemailed passed/uncertain stored reviews without another model run."""
-    _invoke("notify", parameters)
+    from .notifications import notify_command
+
+    return notify_command(args)
 
 
 @app.command("review-schema")
-def review_schema_command():
+@_invoke
+def review_schema_command(args):
     """Print the strict JSON output schema sent to the review model."""
     import json
 
@@ -617,32 +537,25 @@ def review_schema_command():
     click.echo(json.dumps(judgement_schema(), indent=2, ensure_ascii=False))
 
 
-@app.command("export")
-@click.option("--db", type=click.Path(path_type=Path), default=Path("openrent.sqlite"))
-@click.option("--output", type=click.Path(path_type=Path), help="CSV file; replaced atomically.")
-@click.option("--columns", type=column_names, help="Comma-separated fields to export.")
-@click.option(
-    "--active-only",
-    is_flag=True,
-    help="Only listings disclosed as live.",
-)
-@click.option("--list-columns", is_flag=True, help="List available fields.")
-def export_command(**parameters):
-    """Export a selected set of SQLite fields to CSV."""
-    _invoke("export", parameters)
-
-
 @app.command("stats")
 @click.option("--db", type=click.Path(path_type=Path), default=Path("openrent.sqlite"))
-def stats_command(**parameters):
+@_invoke
+def stats_command(args):
     """Show stored listing and image counts."""
-    _invoke("stats", parameters)
+    from .review_db import ReviewDatabase
+
+    if not args.db.is_file():
+        raise SearchError(f"Database does not exist: {args.db}")
+    with ReviewDatabase(args.db) as db:
+        for key, value in db.counts().items():
+            click.echo(f"{key}: {value}")
 
 
 @app.command("schema")
-def schema_command():
+@_invoke
+def schema_command(args):
     """Print the normalized SQLite schema."""
-    _invoke("schema", {})
+    click.echo(files("openrent").joinpath("schema.sql").read_text())
 
 
 def main(argv=None):

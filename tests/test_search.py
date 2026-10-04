@@ -148,6 +148,32 @@ def test_invalid_move_in_date_cannot_silently_exclude_a_listing():
         )
 
 
+def test_today_filter_uses_the_london_calendar_date_and_validates_listing_timestamps():
+    opts = options(today=True)
+    source = SearchData([])
+    today = date(2026, 10, 4)
+
+    # BST makes this UTC date appear on the following London calendar day.
+    assert matches_criteria(
+        *opts,
+        candidate(first_listed_at="2026-10-03T23:30:00+00:00"),
+        source,
+        reference_date=today,
+    )
+    assert not matches_criteria(
+        *opts,
+        candidate(first_listed_at="2026-10-03T22:30:00+00:00"),
+        source,
+        reference_date=today,
+    )
+    with pytest.raises(SearchError, match="first_listed_at.*--today"):
+        matches_criteria(*opts, candidate(first_listed_at=None), source, reference_date=today)
+    with pytest.raises(SearchError, match="invalid first_listed_at.*--today"):
+        matches_criteria(
+            *opts, candidate(first_listed_at="not-a-timestamp"), source, reference_date=today
+        )
+
+
 def test_only_geography_is_sent_and_model_defaults_are_unconstrained():
     from dataclasses import fields
 

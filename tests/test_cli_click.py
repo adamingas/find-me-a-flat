@@ -56,6 +56,7 @@ def test_fetch_aliases_and_typed_arguments(captured_scan, tmp_path):
             "house",
             "--move-in-before",
             "2026-11-30",
+            "--today",
             "--db",
             str(db),
             "--cookie-file",
@@ -75,6 +76,7 @@ def test_fetch_aliases_and_typed_arguments(captured_scan, tmp_path):
     assert args.requests_per_second == 1.5
     assert tuple(args.property_types) == ("flat", "house")
     assert args.move_in_before == date(2026, 11, 30)
+    assert args.today is True
     assert args.db == db
     assert isinstance(args.db, Path)
     assert args.cookie_file == cookie_file
@@ -85,14 +87,16 @@ def test_fetch_aliases_and_typed_arguments(captured_scan, tmp_path):
     assert website.rent_max == Decimal("2500.50")
     assert website.property_types == ("flat", "house")
     assert website.pets is None and website.furnishing is None
+    assert website.today is True
     assert website.include_unavailable is False  # Deliberate CLI default.
     assert set(api.parameters()) == {"term", "searchType", "area"}
 
 
 @pytest.mark.parametrize(
-    "flags, expected",
+    "flags, expected, exit_code",
     [
-        (["--radius-distance", "2"], "--location"),
+        (["--radius-distance", "2"], "--location", 2),
+        (["--location", "Victoria, London"], "radius", 1),
         (
             [
                 "--location",
@@ -103,14 +107,18 @@ def test_fetch_aliases_and_typed_arguments(captured_scan, tmp_path):
                 "15",
             ],
             "radius",
+            1,
         ),
     ],
 )
-def test_location_and_one_radius_are_required(flags, expected, captured_scan):
+def test_location_and_one_radius_are_required(flags, expected, exit_code, monkeypatch):
+    def forbidden(**kwargs):
+        pytest.fail("Invalid search options must fail before opening an HTTP client")
+
+    monkeypatch.setattr(cli, "OpenRentClient", forbidden)
     result = CliRunner().invoke(cli.app, ["fetch", *flags])
-    assert result.exit_code == 2
+    assert result.exit_code == exit_code
     assert expected in result.output.lower()
-    assert not captured_scan
 
 
 def test_daemon_requires_user_supplied_cron(captured_scan):

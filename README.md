@@ -71,7 +71,7 @@ Cron support runs in the foreground; an automatic startup service is not install
 The live workflow has been tested on macOS; Linux and the Responses backend still need
 a live end-to-end check.
 
-- [Flags, cron scheduling, CSV export, storage and source coverage](docs/reference.md)
+- [Flags, cron scheduling, storage and source coverage](docs/reference.md)
 - [Review backends, output schema, email previews/retries and SQL queries](docs/reviews.md)
 
 Use `uv run openrent COMMAND --help` for all options.
