@@ -42,7 +42,10 @@ uv run --locked --no-dev openrent fetch \
 Locations can be an area, address, station or postcode that OpenRent resolves.
 Victoria is an explicit argument. For distance instead of commute time, replace
 `--radius-minutes 25` with `--radius-distance 2` (kilometres by default).
-Repeated fetches update existing listing IDs and reuse downloaded images.
+Repeated fetches resume unfinished work and skip saved metadata and downloaded images.
+Use `--refresh` to update saved listing details. The search always runs fresh.
+DBOS stores checkpoints and image responses in `DB.downloads.sqlite`; preserve it
+with the archive. Overlapping fetch processes take turns using this SQLite sidecar.
 
 ## Review and email
 
@@ -62,8 +65,8 @@ sent to that recipient. An empty or incomplete cycle sends nothing. Both
 
 ## Operations and reference
 
-Keep the archive on writable local storage. When moving it, preserve **both**
-`data/flats.sqlite` and `data/flats.sqlite.review.sqlite`; use SQLite backups or
+Keep the archive on writable local storage. When moving it, preserve
+`data/flats.sqlite`, `data/flats.sqlite.review.sqlite`, and `data/flats.sqlite.downloads.sqlite`; use SQLite backups or
 stop writers and checkpoint before copying. The sidecar holds review and email history.
 Credentials and databases are ignored by Git.
 

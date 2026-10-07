@@ -15,6 +15,7 @@ import click
 
 from .async_db import AsyncDatabase
 from .client import BASE_URL, FetchError, OpenRentClient
+from .download_workflows import downloads
 from .models import Candidate
 from .parsing import enrich_summary, parse_property, parse_search
 from .search import ApiFilters, SearchError, WebsiteFilters, matches_criteria
@@ -107,6 +108,7 @@ def scan_flags(command):
             ),
             click.option("--db", type=click.Path(path_type=Path), default=Path("openrent.sqlite")),
             click.option("--skip-images", is_flag=True, help="Save image metadata without bytes."),
+            click.option("--refresh", is_flag=True, help="Re-fetch completed listing metadata."),
             click.option(
                 "--filter/--no-filter",
                 "post_filter",
@@ -279,9 +281,7 @@ async def fetch(args):
         candidates = [
             candidate
             for candidate in search.candidates
-            if matches_criteria(
-                api, website, candidate, search, reference_date=reference_date
-            )
+            if matches_criteria(api, website, candidate, search, reference_date=reference_date)
         ]
         if args.sort == "rent-asc":
             candidates.sort(key=lambda c: c.property.rent_pcm_pence or 0)
@@ -315,17 +315,11 @@ async def fetch(args):
         seen = []
         async with AsyncDatabase(args.db) as db:
 
-            async def download(property_id, picture):
-                nonlocal downloaded, errors
+            async def download(property_id, picture, response):
+                nonlocal downloaded
                 if await db.image_downloaded(property_id, picture.source_url):
                     return
-                try:
-                    content, mime, dimensions, headers = await client.image(picture.source_url)
-                except FetchError as exc:
-                    errors += 1
-                    await db.record_image_error(property_id, picture.source_url, str(exc))
-                    log(args, f"{property_id} image: {exc}")
-                    return
+                content, mime, dimensions, headers = response
                 picture.width, picture.height = dimensions
                 stored = await db.store_image(
                     property_id,
@@ -337,29 +331,34 @@ async def fetch(args):
                 )
                 downloaded += stored
 
-            async def load(candidate, summaries):
-                nonlocal new_properties, imported, errors
+            async def load(candidate, summary):
                 try:
                     prop = candidate.property
-                    if prop.id in summaries:
+                    if summary is not None:
                         try:
-                            enrich_summary(candidate, summaries[prop.id])
+                            enrich_summary(candidate, summary)
                         except ValueError as exc:
                             log(args, f"{prop.id}: invalid summary; using detail page: {exc}")
-                    detail = await client.get(BASE_URL + f"/{prop.id}")
-                    prop = await asyncio.to_thread(
-                        parse_property, detail.text, str(detail.url), candidate
-                    )
+                    saved = None if args.refresh else await db.get_property(prop.id)
+                    if saved is not None and saved["source_html"]:
+                        html, url = saved["source_html"], saved["url"]
+                    else:
+                        detail = await client.get(BASE_URL + f"/{prop.id}")
+                        html, url = detail.text, str(detail.url)
+                    prop = await asyncio.to_thread(parse_property, html, url, candidate)
                     if args.no_source_html:
                         prop.source_html = None
-                    current = Candidate(prop, candidate.distance_km, candidate.commute_minutes)
-                    matches = matches_criteria(
-                        api, website, current, search, reference_date=reference_date
-                    )
+                    return prop
                 except (FetchError, ValueError) as exc:
-                    errors += 1
                     log(args, f"{candidate.property.id}: {exc}")
-                    return
+                    raise
+
+            async def save(candidate, prop):
+                nonlocal new_properties, imported
+                current = Candidate(prop, candidate.distance_km, candidate.commute_minutes)
+                matches = matches_criteria(
+                    api, website, current, search, reference_date=reference_date
+                )
                 if not matches:
                     if await db.get_property(prop.id):
                         await db.upsert_property(prop)
@@ -368,30 +367,56 @@ async def fetch(args):
                 inserted = await db.upsert_property(prop)
                 new_properties += inserted
                 imported += 1
-                seen.append(prop.id)
                 log(args, f"[{imported}/{len(candidates)}] {prop.id}: {prop.title}")
-                if not args.skip_images:
-                    await gather_tasks(download(prop.id, picture) for picture in prop.images)
+                return prop
 
-            async def load_group(group):
+            async def summary(group):
                 try:
-                    summaries = {
-                        int(s["id"]): s
-                        for s in await client.summaries([c.property.id for c in group])
-                    }
+                    ids = []
+                    for candidate in group:
+                        saved = (
+                            None if args.refresh else await db.get_property(candidate.property.id)
+                        )
+                        if saved is None or not saved["source_html"]:
+                            ids.append(candidate.property.id)
+                    return {int(s["id"]): s for s in await client.summaries(ids)} if ids else {}
                 except (FetchError, ValueError, TypeError) as exc:
                     log(args, f"Summary API unavailable; fetching detail pages: {exc}")
-                    summaries = {}
-                await gather_tasks(load(candidate, summaries) for candidate in group)
+                    return {}
 
-            await gather_tasks(
-                load_group(candidates[start : start + 20])
-                for start in range(0, len(candidates), 20)
-            )
-            if args.post_filter:
-                kept = await db.filter_properties(seen)
-                filtered_out = len(seen) - len(kept)
-                log(args, f"Post-filter kept {len(kept)} listings; deleted {filtered_out}.")
+            async with downloads(args.db, summary, load, save, client.image, download) as runtime:
+
+                async def resume_image(metadata_id, property_id, picture):
+                    if await db.image_downloaded(property_id, picture.source_url):
+                        return
+                    try:
+                        await runtime.image(metadata_id, property_id, picture)
+                    except FetchError as exc:
+                        await db.record_image_error(property_id, picture.source_url, str(exc))
+                        raise
+
+                async def resume(metadata_id, handle):
+                    nonlocal errors
+                    try:
+                        prop = await handle.get_result(polling_interval_sec=0.01)
+                        if prop is None or not await db.get_property(prop.id):
+                            return
+                        seen.append(prop.id)
+                        if not args.skip_images:
+                            await gather_tasks(
+                                resume_image(metadata_id, prop.id, picture)
+                                for picture in prop.images
+                            )
+                    except (FetchError, ValueError) as exc:
+                        errors += 1
+                        log(args, f"{metadata_id}: {exc}")
+
+                handles = await runtime.prepare(candidates, args.refresh)
+                await gather_tasks(resume(metadata_id, handle) for metadata_id, handle in handles)
+                if args.post_filter:
+                    kept = await db.filter_properties(seen)
+                    filtered_out = len(seen) - len(kept)
+                    log(args, f"Post-filter kept {len(kept)} listings; deleted {filtered_out}.")
             counts = await db.counts()
         filter_summary = f"Post-filter deleted {filtered_out}. " if args.post_filter else ""
         print(
@@ -439,6 +464,7 @@ class InterruptedScan(click.ClickException):
 
 def _invoke(command):
     """Run a Click callback with shared async execution and error reporting."""
+
     @wraps(command)
     def invoke(**parameters):
         try:
