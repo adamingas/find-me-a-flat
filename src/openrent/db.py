@@ -373,6 +373,14 @@ class Database:
             "SELECT * FROM properties WHERE id = ?", (property_id,)
         ).fetchone()
 
+    def get_images(self, property_id: int) -> list[Image]:
+        return [
+            Image(**{name: row[name] for name in Image.__dataclass_fields__})
+            for row in self.connection.execute(
+                "SELECT * FROM property_images WHERE property_id = ?", (property_id,)
+            )
+        ]
+
     def _delete_properties(self, property_ids: list[int]) -> int:
         """Delete inside the caller's transaction, retaining all shared image bytes."""
         if self.connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:

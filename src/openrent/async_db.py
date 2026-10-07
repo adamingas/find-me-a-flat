@@ -158,6 +158,9 @@ class AsyncDatabase:
     async def get_property(self, property_id: int) -> sqlite3.Row | None:
         return await self._call("get_property", property_id)
 
+    async def get_images(self, property_id: int) -> list[Image]:
+        return await self._call("get_images", property_id)
+
     async def upsert_property(self, property: Property) -> bool:
         return await self._call("upsert_property", property)
 

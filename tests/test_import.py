@@ -297,7 +297,7 @@ def test_detail_failure_preserves_archived_listing(fake_source, tmp_path):
     path = tmp_path / "archive.sqlite"
     assert run_import(path) == 0
     fake_source.detail_fails = True
-    assert run_import(path) == 1
+    assert run_import(path, "--refresh") == 1
     with Database(path) as db:
         assert db.get_property(101) is not None
 
@@ -338,9 +338,7 @@ def test_dry_run_does_not_create_database(fake_source, tmp_path):
     assert not path.exists()
 
 
-def test_post_filter_prunes_saved_listings_in_daemon_and_can_be_disabled(
-    fake_source, tmp_path
-):
+def test_post_filter_prunes_saved_listings_in_daemon_and_can_be_disabled(fake_source, tmp_path):
     path = tmp_path / "archive.sqlite"
     original = fake_source.search.candidates[0]
     fake_source.search.candidates = []
@@ -363,7 +361,7 @@ def test_post_filter_prunes_saved_listings_in_daemon_and_can_be_disabled(
         # A rejected-looking listing outside this scan must survive.
         db.upsert_property(Property(999, "https://www.openrent.co.uk/999"))
     assert run_import(path, "--no-filter") == 0
-    assert fake_source.image_calls == 6
+    assert fake_source.image_calls == 1
     with Database(path) as db:
         assert db.counts()["properties"] == 7
 
@@ -394,9 +392,11 @@ def test_post_filter_prunes_saved_listings_in_daemon_and_can_be_disabled(
         ] == [101, 999]
         assert db.counts()["downloaded_images"] == db.counts()["image_blobs"] == 1
         assert not db.connection.execute("PRAGMA foreign_key_check").fetchall()
-    # Re-fetching without the filter restores previously deleted IDs.
+    # Only an explicit refresh restores previously deleted IDs.
     assert run_import(path, "--no-filter") == 0
-    assert fake_source.image_calls == 11
+    assert fake_source.image_calls == 1
+    assert run_import(path, "--no-filter", "--refresh") == 0
+    assert fake_source.image_calls == 1
     with Database(path) as db:
         assert db.counts()["properties"] == 7
 
@@ -407,25 +407,25 @@ def test_post_filter_uses_refreshed_metadata_and_can_remove_every_match(fake_sou
         NearbyPlace("Tube", "underground", 11)
     ]
     fake_source.search.candidates[0].property.epc_rating = "C"
-    assert run_import(path, "--filter", "--skip-images") == 0
+    assert run_import(path, "--filter", "--skip-images", "--refresh") == 0
     fake_source.search.candidates[0].property.epc_rating = "D"
-    assert run_import(path, "--filter", "--skip-images") == 0
+    assert run_import(path, "--filter", "--skip-images", "--refresh") == 0
     with Database(path) as db:
         assert db.get_property(101) is None
     fake_source.search.candidates[0].property.epc_rating = "B"
-    assert run_import(path, "--filter", "--skip-images") == 0
+    assert run_import(path, "--filter", "--skip-images", "--refresh") == 0
     with Database(path) as db:
         assert db.get_property(101) is not None
     fake_source.search.candidates[0].property.nearby_places = [
         NearbyPlace("Tube", "underground", 12)
     ]
-    assert run_import(path, "--filter", "--skip-images") == 0
+    assert run_import(path, "--filter", "--skip-images", "--refresh") == 0
     with Database(path) as db:
         assert db.counts()["properties"] == 0
     fake_source.search.candidates[0].property.nearby_places = [
         NearbyPlace("Tube", "underground", 10)
     ]
-    assert run_import(path, "--filter", "--skip-images") == 0
+    assert run_import(path, "--filter", "--skip-images", "--refresh") == 0
     with Database(path) as db:
         assert db.get_property(101) is not None
 
@@ -448,3 +448,57 @@ def test_non_london_commute_is_rejected_without_database(fake_source, tmp_path):
         == 1
     )
     assert not path.exists()
+
+
+def test_successful_summary_survives_detail_failure_and_absent_search(fake_source, tmp_path):
+    path = tmp_path / "archive.sqlite"
+    fake_source.detail_fails = True
+    assert run_import(path) == 1
+    fake_source.detail_fails = False
+    fake_source.search.candidates = []
+    assert run_import(path) == 0
+    assert fake_source.summary_batches == [[101]]
+    assert fake_source.detail_ids == [101, 101]
+    assert fake_source.image_calls == 1
+    with Database(path) as db:
+        assert db.get_property(101) is not None
+
+
+def test_skip_images_resumes_even_when_search_no_longer_contains_property(fake_source, tmp_path):
+    path = tmp_path / "archive.sqlite"
+    assert run_import(path, "--skip-images") == 0
+    fake_source.search.candidates = []
+    assert run_import(path) == 0
+    assert fake_source.summary_batches == [[101]]
+    assert fake_source.detail_ids == [101]
+    assert fake_source.image_calls == 1
+
+
+def test_legacy_details_and_gallery_bootstrap_without_http(fake_source, tmp_path):
+    path = tmp_path / "archive.sqlite"
+    prop = copy.deepcopy(fake_source.search.candidates[0].property)
+    prop.source_html = "previously parsed HTML"
+    with Database(path) as db:
+        db.upsert_property(prop)
+    assert run_import(path) == 0
+    assert fake_source.summary_batches == []
+    assert fake_source.detail_ids == []
+    assert fake_source.image_calls == 1
+
+
+def test_successful_detail_survives_database_write_failure(fake_source, tmp_path, monkeypatch):
+    path = tmp_path / "archive.sqlite"
+    original = cli.AsyncDatabase.upsert_property
+
+    async def fail(*args):
+        import sqlite3
+
+        raise sqlite3.OperationalError("simulated write failure")
+
+    monkeypatch.setattr(cli.AsyncDatabase, "upsert_property", fail)
+    assert run_import(path) == 1
+    monkeypatch.setattr(cli.AsyncDatabase, "upsert_property", original)
+    assert run_import(path) == 0
+    assert fake_source.summary_batches == [[101]]
+    assert fake_source.detail_ids == [101]
+    assert fake_source.image_calls == 1
