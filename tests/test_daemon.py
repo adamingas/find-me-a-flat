@@ -39,6 +39,75 @@ def arguments(**overrides):
     return SimpleNamespace(**values)
 
 
+def test_pipeline_retries_pending_downloads_without_waiting_for_discovery():
+    async def scenario():
+        retried = asyncio.Event()
+        attempts = 0
+
+        async def discovery():
+            pytest.fail("Annual discovery should not run during this test")
+
+        async def drain():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise FetchError("Temporary download failure")
+            retried.set()
+            return 0
+
+        task = asyncio.create_task(
+            daemon.run_pipeline(
+                arguments(cron="0 0 1 1 *", max_runs=None, retry_interval=0.01),
+                discovery,
+                drain,
+                install_signals=False,
+            )
+        )
+        try:
+            await asyncio.wait_for(retried.wait(), 1)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert attempts == 2
+
+    asyncio.run(scenario())
+
+
+def test_pipeline_sigterm_cancels_all_stages_and_restores_handlers(monkeypatch):
+    handlers = {signal.SIGINT: signal.SIG_DFL, signal.SIGTERM: signal.SIG_DFL}
+    original = handlers.copy()
+    monkeypatch.setattr(daemon.signal, "getsignal", handlers.__getitem__)
+    monkeypatch.setattr(daemon.signal, "signal", handlers.__setitem__)
+
+    async def scenario():
+        started = {stage: asyncio.Event() for stage in ("discovery", "downloads", "review")}
+        cancelled = set()
+
+        async def stage(name):
+            started[name].set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.add(name)
+
+        task = asyncio.create_task(
+            daemon.run_pipeline(
+                arguments(run_now=True, max_runs=None, review_cron=None, retry_interval=60),
+                lambda: stage("discovery"),
+                lambda: stage("downloads"),
+                lambda: stage("review"),
+            )
+        )
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started.values())), 1)
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        assert await asyncio.wait_for(task, 1) == 0
+        assert cancelled == set(started)
+
+    asyncio.run(scenario())
+    assert handlers == original
+
+
 def run(args, scan, clock, **options):
     return asyncio.run(
         daemon.run_daemon(

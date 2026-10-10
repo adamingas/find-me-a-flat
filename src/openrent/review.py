@@ -7,6 +7,7 @@ import hashlib
 import math
 import os
 import shutil
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,7 +78,9 @@ def configuration(args) -> ReviewConfig:
     )
 
 
-async def process_pending(config: ReviewConfig, *, quiet=False, dry_run=False) -> int:
+async def process_pending(
+    config: ReviewConfig, *, quiet=False, dry_run=False, ready_only=False
+) -> int:
     if config.stop_after_pass and config.concurrency != 1:
         raise ValueError("--stop-after-pass requires --review-concurrency 1.")
     if config.stop_after_pass and config.notifications is not None:
@@ -93,7 +96,7 @@ async def process_pending(config: ReviewConfig, *, quiet=False, dry_run=False) -
     # decision is committed; a changed input remains unprocessed for retry.
     with ScanLock(Path(str(config.database.resolve()) + ".review")):
         async with AsyncReviewDatabase(config.database) as db:
-            ids = await db.unprocessed_ids(limit=config.limit)
+            ids = await db.unprocessed_ids(limit=config.limit, ready_only=ready_only)
             if dry_run:
                 print(
                     f"{len(ids)} unprocessed listings ready for review "
@@ -159,10 +162,12 @@ async def process_pending(config: ReviewConfig, *, quiet=False, dry_run=False) -
                         totals["error"] += 1
                         report(f"{property_id}: review failed; left unprocessed: {exc}")
 
-            async with OpenRentClient() as client:
+            async with nullcontext(None) if ready_only else OpenRentClient() as client:
 
                 async def prepare_and_assess(property_id):
-                    if not await prepare_gallery(db, property_id, client=client, report=report):
+                    if not ready_only and not await prepare_gallery(
+                        db, property_id, client=client, report=report
+                    ):
                         totals["error"] += 1
                         return
                     await assess(property_id)
@@ -186,7 +191,11 @@ async def process_pending(config: ReviewConfig, *, quiet=False, dry_run=False) -
                     # Drain fresh IDs, but leave failed attempts for the next run.
                     if config.limit is not None or stopped.is_set():
                         break
-                    ids = [item for item in await db.unprocessed_ids() if item not in attempted]
+                    ids = [
+                        item
+                        for item in await db.unprocessed_ids(ready_only=ready_only)
+                        if item not in attempted
+                    ]
             print(
                 f"Reviews: {totals['pass']} pass, {totals['reject']} reject, "
                 f"{totals['uncertain']} uncertain, {totals['error']} failed.",
@@ -194,7 +203,7 @@ async def process_pending(config: ReviewConfig, *, quiet=False, dry_run=False) -
             )
             notification_result = 0
             if config.notifications is not None:
-                pending_ids = await db.unprocessed_ids()
+                pending_ids = await db.unprocessed_ids(ready_only=ready_only)
                 remaining = (
                     [item for item in pending_ids if item in attempted]
                     if config.limit is not None

@@ -6,10 +6,174 @@ from types import SimpleNamespace
 
 import pytest
 
-from openrent import cli
+from openrent import cli, ingestion
 from openrent.client import FetchError, retry_request
 from openrent.db import Database
 from openrent.models import Candidate, Image, NearbyPlace, Property, SearchData
+
+
+def test_service_discovers_and_reviews_new_arrivals_while_an_old_photo_is_blocked(
+    fake_source, tmp_path, monkeypatch
+):
+    from openrent import daemon, review
+    from openrent.judge import Judgement
+    from openrent.review_models import CriterionResult
+
+    path = tmp_path / "archive.sqlite"
+    criteria = tmp_path / "criteria.txt"
+    criteria.write_text("Example criteria")
+    first = fake_source.search.candidates[0]
+    first.property.images[0].source_url = "https://imagescdn.openrent.co.uk/101/a.png"
+    second = copy.deepcopy(first)
+    second.property.id = 102
+    second.property.url = "https://www.openrent.co.uk/102"
+    second.property.images[0].source_url = "https://imagescdn.openrent.co.uk/102/a.png"
+    reviewed = []
+
+    async def scenario():
+        old_photo_started = asyncio.Event()
+        release_old_photo = asyncio.Event()
+        new_photo_saved = asyncio.Event()
+        new_flat_reviewed = asyncio.Event()
+        original_image = cli.OpenRentClient.image
+        original_store = cli.AsyncDatabase.store_image
+
+        async def image(client, url):
+            if "/101/" in url:
+                old_photo_started.set()
+                await release_old_photo.wait()
+            return await original_image(client, url)
+
+        async def store(db, property_id, *args, **kwargs):
+            result = await original_store(db, property_id, *args, **kwargs)
+            if property_id == 102:
+                new_photo_saved.set()
+            return result
+
+        async def judge(snapshot, images, criteria, **kwargs):
+            reviewed.append(snapshot["id"])
+            assert fake_source.open_clients == 1
+            if snapshot["id"] == 102:
+                assert not release_old_photo.is_set()
+                new_flat_reviewed.set()
+            return Judgement.model_validate(
+                {
+                    name: {"outcome": True, "evidence": "Image 1"}
+                    for name, field in Judgement.model_fields.items()
+                    if isinstance(field.annotation, type)
+                    and issubclass(field.annotation, CriterionResult)
+                }
+                | {
+                    "summary": "Suitable",
+                    "area_m2": None,
+                    "floor": {"value": 0.0, "evidence": "Ground floor"},
+                }
+            )
+
+        async def scheduler(args, callback, **kwargs):
+            if args.cron == "0 * * * *":
+                assert await callback(args) == 0
+                await asyncio.wait_for(old_photo_started.wait(), 2)
+                fake_source.search.candidates.append(second)
+                assert await callback(args) == 0
+                # This cannot complete if discovery, new downloads or review
+                # must wait for the older gallery to finish.
+                await asyncio.wait_for(new_flat_reviewed.wait(), 2)
+                release_old_photo.set()
+            else:
+                assert args.cron == "*/10 * * * *"
+                await asyncio.wait_for(new_photo_saved.wait(), 2)
+                assert await callback(args) == 0
+            return 0
+
+        monkeypatch.setattr(cli.OpenRentClient, "image", image)
+        monkeypatch.setattr(cli.AsyncDatabase, "store_image", store)
+        monkeypatch.setattr(daemon, "run_daemon", scheduler)
+        monkeypatch.setattr(review, "judge_property", judge)
+        monkeypatch.setenv("OPENAI_API_KEY", "test-placeholder")
+        with cli.app.commands["daemon"].make_context(
+            "daemon",
+            [
+                "--location",
+                "Cambridge",
+                "--radius-distance",
+                "1",
+                "--db",
+                str(path),
+                "--cron",
+                "0 * * * *",
+                "--review-cron",
+                "*/10 * * * *",
+                "--criteria-file",
+                str(criteria),
+                "--review-backend",
+                "responses",
+                "--review-model",
+                "test-model",
+                "--concurrency",
+                "2",
+                "--quiet",
+            ],
+        ) as context:
+            assert await asyncio.wait_for(cli.daemon(SimpleNamespace(**context.params)), 5) == 0
+
+    asyncio.run(scenario())
+    assert reviewed == [102, 101]
+    assert sorted(fake_source.detail_ids) == [101, 102]
+    assert sorted(i for batch in fake_source.summary_batches for i in batch) == [101, 102]
+    assert fake_source.image_calls == 2 and fake_source.open_clients == 0
+    with Database(path) as db:
+        assert db.counts()["downloaded_images"] == 2
+
+
+def test_service_resumes_saved_images_before_its_first_discovery_tick(
+    fake_source, tmp_path, monkeypatch
+):
+    path = tmp_path / "archive.sqlite"
+    fake_source.image_fails = True
+    assert run_import(path) == 1
+    fake_source.image_fails = False
+
+    async def scenario():
+        saved = asyncio.Event()
+        original_store = cli.AsyncDatabase.store_image
+
+        async def store(db, *args, **kwargs):
+            result = await original_store(db, *args, **kwargs)
+            saved.set()
+            return result
+
+        async def forbidden(*args, **kwargs):
+            raise AssertionError("Resume must not wait for or trigger discovery")
+
+        monkeypatch.setattr(cli.AsyncDatabase, "store_image", store)
+        monkeypatch.setattr(cli.OpenRentClient, "search", forbidden)
+        with cli.app.commands["daemon"].make_context(
+            "daemon",
+            [
+                "--location",
+                "Cambridge",
+                "--radius-distance",
+                "1",
+                "--db",
+                str(path),
+                "--cron",
+                "0 0 1 1 *",
+                "--quiet",
+            ],
+        ) as context:
+            task = asyncio.create_task(cli.daemon(SimpleNamespace(**context.params)))
+        await asyncio.wait_for(saved.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+
+    asyncio.run(scenario())
+    assert fake_source.detail_ids == [101]
+    assert len(fake_source.summary_batches) == 1
+    assert fake_source.image_calls == 2 and fake_source.open_clients == 0
+    with Database(path) as db:
+        assert db.counts()["downloaded_images"] == 1
 
 
 @pytest.fixture
@@ -109,9 +273,13 @@ def fake_source(monkeypatch):
                 state.active_images -= 1
 
     monkeypatch.setattr(cli, "OpenRentClient", FakeClient)
-    monkeypatch.setattr(cli, "parse_search", lambda *args, **kwargs: copy.deepcopy(state.search))
-    monkeypatch.setattr(cli, "parse_property", lambda html, url, candidate: candidate.property)
-    monkeypatch.setattr(cli, "enrich_summary", lambda candidate, summary: candidate)
+    monkeypatch.setattr(
+        ingestion, "parse_search", lambda *args, **kwargs: copy.deepcopy(state.search)
+    )
+    monkeypatch.setattr(
+        ingestion, "parse_property", lambda html, url, candidate: candidate.property
+    )
+    monkeypatch.setattr(ingestion, "enrich_summary", lambda candidate, summary: candidate)
     return state
 
 

@@ -182,7 +182,7 @@ class ReviewDatabase(Database):
             is not None
         )
 
-    def unprocessed_ids(self, limit: int | None = None) -> list[int]:
+    def unprocessed_ids(self, limit: int | None = None, ready_only=False) -> list[int]:
         """Return live IDs with no completed review, including incomplete galleries."""
         if limit is not None and (
             not isinstance(limit, int) or isinstance(limit, bool) or limit < 1
@@ -192,8 +192,18 @@ class ReviewDatabase(Database):
             "SELECT p.id FROM main.properties p "
             "WHERE (p.is_live IS NULL OR p.is_live != 0) "
             "AND NOT EXISTS (SELECT 1 FROM review.property_reviews r "
-            "WHERE r.property_id = p.id AND r.status = 'complete') ORDER BY p.id"
+            "WHERE r.property_id = p.id AND r.status = 'complete') "
         )
+        if ready_only:
+            query += (
+                "AND EXISTS (SELECT 1 FROM main.property_images i "
+                "WHERE i.property_id = p.id AND i.kind = 'photo') "
+                "AND NOT EXISTS (SELECT 1 FROM main.property_images i "
+                "LEFT JOIN main.image_blobs b ON b.sha256 = i.content_sha256 "
+                "WHERE i.property_id = p.id AND "
+                "(i.download_status != 'downloaded' OR b.sha256 IS NULL)) "
+            )
+        query += "ORDER BY p.id"
         parameters = () if limit is None else (limit,)
         if limit is not None:
             query += " LIMIT ?"
@@ -591,8 +601,8 @@ class AsyncReviewDatabase(AsyncDatabase):
     ) -> list[int]:
         return await self._call("candidate_ids", profile_key, once_per_property, limit)
 
-    async def unprocessed_ids(self, limit: int | None = None) -> list[int]:
-        return await self._call("unprocessed_ids", limit)
+    async def unprocessed_ids(self, limit: int | None = None, ready_only=False) -> list[int]:
+        return await self._call("unprocessed_ids", limit, ready_only)
 
     async def pending_review_images(self, property_id: int) -> list[dict[str, Any]]:
         return await self._call("pending_review_images", property_id)

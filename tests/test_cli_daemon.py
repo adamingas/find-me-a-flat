@@ -61,6 +61,16 @@ def test_scanners_do_not_take_a_database_wide_process_lock(tmp_path, monkeypatch
         return 0
 
     monkeypatch.setattr(cli, "fetch", scan)
+
+    async def discover(args, *_, **kwargs):
+        calls.append(args.location)
+        return {}
+
+    async def drain(*_):
+        return 0
+
+    monkeypatch.setattr(cli, "discover", discover)
+    monkeypatch.setattr(cli, "drain", drain)
     db = tmp_path / "archive.sqlite"
     # An existing legacy lock no longer blocks manual or daemon ingestion.
     with ScanLock(db):

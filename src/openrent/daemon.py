@@ -1,4 +1,4 @@
-"""Foreground cron scheduler for repeated, non-overlapping listing imports."""
+"""Cron scheduling and supervision of discovery, downloads, and review."""
 
 import asyncio
 import re
@@ -139,14 +139,14 @@ async def run_daemon(
     *,
     now: Callable[[], datetime] | None = None,
     wait: Callable[[float], Awaitable[object]] | None = None,
-    stop_event: threading.Event | None = None,
+    stop_event: threading.Event | asyncio.Event | None = None,
     install_signals: bool = True,
 ) -> int:
     """Run scans sequentially until stopped, skipping ticks elapsed in a scan.
 
     ``now`` and async ``wait`` are clock hooks for deterministic tests. The CLI must
-    validate the fetch configuration and acquire its database lock before this
-    loop; ``--check-schedule`` requires neither a database nor a network call.
+    validate its configuration before this loop; ``--check-schedule`` requires
+    neither a database nor a network call.
     ``max_runs`` counts scan attempts, including failures and ``run_now``.
     """
     schedule = validate_schedule(args.cron, args.timezone)
@@ -248,3 +248,106 @@ async def run_daemon(
         return 0
     _log(args, f"Daemon finished after {runs} scans ({failures} failed).")
     return 1 if failures else 0
+
+
+async def run_pipeline(args, discover, drain, review=None, *, install_signals=True):
+    """Schedule producers independently of the continuously running downloader.
+
+    The caller owns the shared HTTP client and databases. A bounded run finishes
+    its queued download pass and final ready reviews; failed jobs remain durable.
+    """
+    wake = asyncio.Event()
+    finished = asyncio.Event()
+    review_stop = asyncio.Event()
+    results = [0, 0, 0]
+    task = asyncio.current_task()
+    handlers = {}
+    interrupted = False
+
+    def stop(signum, _frame):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            task.cancel()
+
+    async def produce(_):
+        try:
+            return await discover()
+        finally:
+            wake.set()
+
+    async def discovery_loop():
+        results[0] = await run_daemon(args, produce, install_signals=False)
+        finished.set()
+        wake.set()
+
+    async def download_pass():
+        try:
+            if await drain():
+                results[1] = 1
+        except (FetchError, ValueError, sqlite3.Error, OSError) as exc:
+            results[1] = 1
+            _log(args, f"Download pass failed: {exc}; queued work will be retried.", error=True)
+
+    async def download_loop():
+        # A slow property must not block new arrivals. Existing property claims
+        # prevent overlapping passes from duplicating requests. The shared HTTP
+        # semaphore bounds their combined requests.
+        async with asyncio.TaskGroup() as downloads:
+            while True:
+                wake.clear()
+                downloads.create_task(download_pass())
+                if finished.is_set():
+                    break
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=args.retry_interval)
+                except TimeoutError:
+                    pass
+        # An explicit refresh may have arrived while an older claim was active.
+        await download_pass()
+
+    async def review_cycle(_):
+        result = await review()
+        results[2] |= result
+        return result
+
+    try:
+        if install_signals and threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, stop)
+        async with asyncio.TaskGroup() as group:
+            producer = group.create_task(discovery_loop(), name="discovery")
+            consumer = group.create_task(download_loop(), name="downloader")
+            if review is not None:
+                review_args = SimpleNamespace(
+                    **(vars(args) | {"cron": args.review_cron or args.cron, "max_runs": None})
+                )
+                reviewer = group.create_task(
+                    run_daemon(
+                        review_args,
+                        review_cycle,
+                        stop_event=review_stop,
+                        install_signals=False,
+                    ),
+                    name="review",
+                )
+            await producer
+            await consumer
+            if review is not None:
+                review_stop.set()
+                await reviewer
+                # A bounded service can finish downloading after the last review tick.
+                review_args.run_now, review_args.max_runs = True, 1
+                results[2] |= await run_daemon(
+                    review_args, review_cycle, install_signals=False
+                )
+    except asyncio.CancelledError:
+        if not interrupted:
+            raise
+        _log(args, "Service stopped; saved downloads and reviews will resume.", error=True)
+        return 0
+    finally:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+    return int(any(results))

@@ -185,7 +185,7 @@ def test_pipeline_retries_failures_reviews_each_id_once_and_bounds_concurrency(
     assert len(calls) == 6
 
 
-def test_daemon_reviews_after_successful_scan_and_rejects_missing_images_before_scan(
+def test_daemon_reviews_independently_and_rejects_missing_images_before_discovery(
     tmp_path, monkeypatch
 ):
     criteria = tmp_path / "conditions.txt"
@@ -193,16 +193,23 @@ def test_daemon_reviews_after_successful_scan_and_rejects_missing_images_before_
     events = []
     scan_result = 0
 
-    async def fetch(args):
-        events.append("fetch")
-        return scan_result
+    async def discover(args, *_, **kwargs):
+        events.append("discover")
+        if scan_result:
+            raise ValueError("Simulated discovery failure")
+        return {}
+
+    async def drain(*_):
+        return 0
 
     async def process(cfg, **kwargs):
         events.append("review")
         assert cfg.backend == "responses" and cfg.model == "test-model"
+        assert kwargs["ready_only"] is True
         return 0
 
-    monkeypatch.setattr(cli, "fetch", fetch)
+    monkeypatch.setattr(cli, "discover", discover)
+    monkeypatch.setattr(cli, "drain", drain)
     monkeypatch.setattr(review, "process_pending", process)
     monkeypatch.setenv("OPENAI_API_KEY", "test-placeholder")
     flags = [
@@ -228,11 +235,11 @@ def test_daemon_reviews_after_successful_scan_and_rejects_missing_images_before_
     runner = CliRunner()
     result = runner.invoke(cli.app, flags)
     assert result.exit_code == 0, result.output
-    assert events == ["fetch", "review"]
+    assert events[0] == "discover" and "review" in events
     events.clear()
     scan_result = 1
     result = runner.invoke(cli.app, flags)
-    assert result.exit_code == 1 and events == ["fetch"]
+    assert result.exit_code == 1 and events[0] == "discover" and "review" in events
     events.clear()
     result = runner.invoke(cli.app, [*flags, "--skip-images"])
     assert result.exit_code == 1 and events == []

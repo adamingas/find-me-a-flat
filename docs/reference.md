@@ -98,11 +98,11 @@ uv run openrent fetch \
   --db data/victoria.sqlite --filter
 ```
 
-The Python function `filter_property_ids(connection, property_ids)` in [filtering.py](../src/openrent/filtering.py) reads saved metadata and returns the passing IDs. Edit that function to add hard-coded rules; its SQLite connection exposes every stored column and related table. It runs on the database worker after listings and their image downloads have been saved, before scheduled model review. It only examines successfully imported IDs from the current scan; unrelated archived listings are left alone.
+The Python function `filter_property_ids(connection, property_ids)` in [filtering.py](../src/openrent/filtering.py) reads saved metadata and returns the passing IDs. Edit that function to add hard-coded rules; its SQLite connection exposes every stored column and related table. It runs on the database worker after detail metadata is saved, before downloading images or scheduled model review. It only examines successfully imported IDs from the current scan; unrelated archived listings are left alone.
 
 Rejected listings are physically deleted, with cascading deletion of features, nearby places, media links, image associations and reviews. Their image BLOBs are removed only when no remaining listing or review references them. Rule evaluation and deletion use one transaction, so a filter or cleanup failure rolls back the pruning. Review profiles remain. The final scan report includes the number deleted.
 
-`--no-filter` is the default and preserves the ordinary archive behaviour. Deleted listings can be fetched again on later scans; their removed images will be downloaded again. `--filter --dry-run` is rejected because this rule requires saved detail metadata. Schedule previews with `--filter --check-schedule` remain read-only.
+`--no-filter` is the default and preserves the ordinary archive behaviour. Deleted IDs remain completed in the download queue; use `--refresh` to fetch and reevaluate them. Cached image bytes can be reused. `--filter --dry-run` is rejected because this rule requires saved detail metadata. Schedule previews with `--filter --check-schedule` remain read-only.
 
 ## Scheduled scanning
 
@@ -120,22 +120,28 @@ uv run openrent daemon \
 
 This example scans at minutes 0, 15, 30 and 45 of each hour. The five fields are **minute, hour, day-of-month, month, day-of-week**. Examples: `0 * * * *` hourly, `0 9,18 * * *` at 09:00 and 18:00, or `*/30 8-22 * * mon-fri` every half hour from 08:00 through 22:30 on weekdays. The default timezone is `Europe/London`; another IANA timezone can be supplied explicitly. There is no preset location, radius, rent, or cron schedule.
 
-The daemon waits for the next matching time by default. Add `--run-now` for an immediate first scan. `--max-runs N` stops after N attempts, including failures and the immediate scan. Omit it to keep running. Preview the next five scheduled times without HTTP requests or database changes:
+Discovery uses `--cron`; review uses `--review-cron`, defaulting to the discovery schedule when `--criteria-file` is supplied. Both run independently of the downloader. Discovery and new download tasks do not wait for older galleries to finish; HTTP requests still wait for the shared semaphore and rate limit. Discovery ticks are skipped only when discovery itself takes longer than its schedule; review likewise runs one cycle at a time.
+
+The downloader immediately resumes persisted work on startup, even without `--run-now`. That flag additionally triggers immediate discovery and review. New discoveries wake the downloader; `--retry-interval` (default 60 seconds) checks unfinished jobs between discoveries. Per-request retries still respect `Retry-After` and exponential backoff. OpenRent search, summary, detail and image requests all use **one shared client, semaphore and rate limiter**. Service-mode review only uses complete stored galleries and never fetches images itself.
+
+`--max-runs N` stops after N discovery attempts, waits for active downloads, makes a final download/review pass, and leaves failed jobs saved for the next start. Omit it for a persistent service. Ctrl+C or SIGTERM cancels and joins all tasks before closing HTTP and SQLite resources; submitted SQLite writes finish first. A graceful signal stop returns 0. A bounded run returns 1 if any discovery, download or review pass failed.
+
+Preview the next five discovery times without HTTP requests or database changes:
 
 ```sh
 uv run openrent daemon \
-  --cron "*/15 * * * *" --timezone Europe/London \
+  --cron "0 * * * *" --timezone Europe/London \
   --location "Victoria, London" --radius-distance 2 \
   --check-schedule
 ```
 
-The daemon awaits scans and uses nonblocking async waits between scheduled times. Each daemon runs its own scans sequentially, while requests within each scan run concurrently. Scheduled ticks that elapse during a scan are skipped, so a slow scan never creates a queue or overlaps the next one. Scan errors are logged and the daemon continues on the next tick. Ctrl+C or SIGTERM cancels the current scan, joins its request tasks, closes clients and database handles, and preserves already committed properties/images. Already submitted SQLite writes finish before shutdown. A graceful daemon shutdown returns 0; a bounded daemon run returns 1 if any attempt failed. As before, repeated scans update the same listing IDs and reuse downloaded images.
+The queue and successful stage results live in `<archive>.downloads.sqlite`; preserve it alongside the archive and review sidecar. Fresh search HTML is requested on each discovery, but saved summaries, detail metadata and image bytes are reused unless `--refresh` explicitly requests metadata again. A crash after an HTTP response but before its checkpoint commits can repeat that request. Already saved image bytes are reused. Filtered-out IDs stay completed and are not resurrected by ordinary discovery; `--refresh` permits reevaluating them.
 
-Multiple manual scans or daemons can write to the same database concurrently. SQLite serializes short write transactions; network fetching continues in parallel. Overlapping listings update the same OpenRent ID. Searches, filter settings and match histories are not stored.
+Multiple manual scans can still share the archive. Per-property locks prevent duplicate concurrent downloads, and SQLite serializes writes. Separate processes have separate HTTP rate limits; run one daemon service when you want one global request budget. Business tables contain no search IDs or search histories; the download sidecar keeps the inputs needed to resume pending work.
 
 Cron supports ordinary numeric values, comma lists, ascending ranges, positive steps, and three-letter month/day names. Sunday is 0 or 7. When both day-of-month and day-of-week are restricted, either match triggers a scan. Six/seven-field cron, macros such as `@hourly`, and extensions such as `L`, `W`, `#`, `?`, `H`, and `R` are rejected. During London's spring clock change, nonexistent local scheduled times are skipped. During the autumn change, matching times in the repeated hour can run once in each occurrence.
 
-Keep the process and host running to maintain scanning. The command runs in the foreground and does not install an OS cron entry, launch agent, system service, or Codex automation. A terminal session or your existing process supervisor can keep it alive; after restarting, it resumes at the next future tick rather than replaying historical scans.
+Keep the process and host running to maintain scanning. The command runs in the foreground and does not install an OS cron entry, launch agent, system service, or Codex automation. A terminal session or your existing process supervisor can keep it alive; after restarting, it immediately resumes downloads and schedules future discovery/review ticks without replaying missed ticks. See the [systemd user service](../deploy/openrent.service) example and [setup instructions](../README.md#service-on-linux).
 
 ## Stored data
 
@@ -190,7 +196,7 @@ PY
 
 ## Repeat runs and failures
 
-Run the same command again to refresh existing properties and discover new IDs. Identical imports do **not** append property, feature or image rows. First-seen timestamps stay fixed; last-seen timestamps refresh, and changed facts update in place. Existing downloaded image URLs are skipped. Matching image bytes across URLs/listings share a single BLOB. Removed gallery associations disappear from the current snapshot while archived image bytes remain in the database.
+Run the same command again to discover new IDs and resume unfinished downloads. Completed metadata is reused; add `--refresh` to fetch updated prices, descriptions and availability. Identical imports do **not** append property, feature or image rows. First-seen timestamps stay fixed; fresh metadata updates last-seen timestamps and changed facts in place. Existing downloaded image URLs are skipped. Matching image bytes across URLs/listings share a single BLOB. Removed gallery associations disappear from the current snapshot while archived image bytes remain in the database.
 
 The importer commits each property and image incrementally. Failed image downloads are recorded and retried on the next execution. Listings absent from a scan remain archived; only newly fetched metadata updates their availability. Existing archives migrate automatically, removing obsolete search tables while retaining listings, images and reviews. Exit code 1 indicates an error, and 130 an interruption; successful saved work is retained.
 
@@ -204,7 +210,7 @@ The importer uses OpenRent's public website request flow:
 
 These are the website's internal endpoints, **not a documented supported developer API**. Search filtering is repeated locally because the initial page contains a geographic superset, and OpenRent applies many filters in JavaScript. Integer server radii are widened slightly to include boundary values; exact requested distance is then enforced using the exposed coordinates and great-circle distance. The parser rejects missing essential arrays, missing or inconsistent reported totals, mismatched lengths and unexpected units rather than treating a broken source as an empty successful search. Location and commute resolution errors are explicit. Fetching a very large area can produce many listings and a large database.
 
-By default every matching ID in the full embedded search arrays receives a detail request; the first 20 visible cards and the 20-ID summary batches do not limit the scan. All discovered gallery images are downloaded unless `--skip-images` is supplied. Failed detail/image requests leave the scan incomplete and return an error. This establishes coverage of the returned search response. It does not independently establish coverage of OpenRent's entire inventory: server-side result caps, listings omitted from public search, and account-only content have not been ruled out. A server that truncates both the ID array and its reported total would not be detected by the count check. Gallery extraction uses the exposed markup; there is no independent source photo-count check, and videos are retained as links.
+Every newly discovered matching ID in the full embedded search arrays receives a detail request; saved successful stages are reused on later runs; the first 20 visible cards and the 20-ID summary batches do not limit the scan. All discovered gallery images are downloaded unless `--skip-images` is supplied. Failed detail/image requests leave the scan incomplete and return an error. This establishes coverage of the returned search response. It does not independently establish coverage of OpenRent's entire inventory: server-side result caps, listings omitted from public search, and account-only content have not been ruled out. A server that truncates both the ID array and its reported total would not be detected by the count check. Gallery extraction uses the exposed markup; there is no independent source photo-count check, and videos are retained as links.
 
 ```sh
 uv run pytest -q

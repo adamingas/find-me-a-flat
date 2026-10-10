@@ -258,11 +258,11 @@ before retrying. This avoids automatic duplicate sends after an ambiguous failur
 
 ## Scheduled reviews
 
-Integrate with the scanner so reviewing follows successful scans:
+Run scheduled review independently of discovery and downloads in one service:
 
 ```sh
 uv run openrent daemon \
-  --cron '*/30 * * * *' --timezone Europe/London --run-now \
+  --cron '0 * * * *' --review-cron '*/10 * * * *' --timezone Europe/London --run-now \
   --location 'Victoria Station, London' --radius-minutes 25 \
   --rent-max 2500 --bedrooms-min 1 --no-shared \
   --db data/victoria.sqlite --criteria-file conditions.txt \
@@ -270,15 +270,9 @@ uv run openrent daemon \
   --review-model MODEL_ID
 ```
 
-The cron expression and search settings are examples you can replace. The daemon reviews
-eligible unprocessed listings in the shared archive, including listings ingested by other
-scanners. Missing gallery images are downloaded before judging; `--skip-images` is rejected
-when this stage is enabled. With `--email-to`, it sends a bundle after the full review cycle
-finishes; a cycle with no live, unprocessed properties exits without an email. `--review-limit`
-restricts each cycle to a selected batch; an email waits for every property in that batch,
-while unselected properties remain for later cycles. A failed fetch does not start a review
-of its partial result, and a failed selected image download or review suppresses the partial
-digest.
+Discovery runs hourly in this example; review runs every ten minutes. The downloader continues between ticks and resumes saved jobs immediately after restarting. Review selects live unprocessed properties whose complete gallery is already saved, including properties ingested by other scanners. Incomplete galleries wait for a later review tick; the review task makes no OpenRent requests. `--skip-images` is rejected when review is enabled.
+
+With `--email-to`, it sends a bundle after the selected ready reviews finish. `--review-limit` limits the ready cohort, so incomplete galleries do not consume the limit. Failed selected reviews suppress that cohort's digest; properties still downloading are considered on later ticks. Completed reviews and email deliveries retain their existing deduplication rules.
 
 Alternatively, keep an existing importer separate and poll its archive:
 

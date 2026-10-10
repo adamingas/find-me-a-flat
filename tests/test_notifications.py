@@ -190,6 +190,7 @@ def test_failed_review_and_empty_initial_cohort_do_not_send_or_reserve_email(tmp
 def test_recipient_isolation_frozen_retry_and_unknown_delivery_are_not_resent(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setenv("RESEND_TOKEN", "test-placeholder")
     path = tmp_path / "archive.sqlite"
     for property_id, decision in ((1, "pass"), (2, "reject"), (3, "uncertain")):
         saved_review(path, property_id, decision)

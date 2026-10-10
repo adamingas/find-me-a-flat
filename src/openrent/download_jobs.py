@@ -56,13 +56,23 @@ class JobDatabase:
             )
         ]
 
-    def enqueue(self, context):
+    def enqueue(self, context, refresh=False):
         property_id = context[0].property.id
         with self.connection:
             self.connection.execute(
                 "INSERT OR IGNORE INTO jobs(key, input) VALUES (?, ?)",
                 (f"import:{property_id}", pickle.dumps(context)),
             )
+            if refresh:
+                self.connection.execute(
+                    "UPDATE jobs SET input = ? WHERE key = ?",
+                    (pickle.dumps(context), f"import:{property_id}"),
+                )
+                self.connection.execute(
+                    "INSERT INTO jobs(key, result) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET result = excluded.result",
+                    (f"refresh:{property_id}", pickle.dumps(True)),
+                )
 
     def work(self):
         return [
@@ -70,7 +80,8 @@ class JobDatabase:
             for row in self.connection.execute(
                 "SELECT j.input FROM jobs j WHERE j.key LIKE 'import:%' AND j.input IS NOT NULL "
                 "AND (j.result IS NULL OR EXISTS (SELECT 1 FROM jobs i "
-                "WHERE i.key LIKE 'image:' || substr(j.key, 8) || ':%' AND i.result IS NULL))"
+                "WHERE i.key LIKE 'image:' || substr(j.key, 8) || ':%' AND i.result IS NULL) "
+                "OR EXISTS (SELECT 1 FROM jobs r WHERE r.key = 'refresh:' || substr(j.key, 8)))"
             )
         ]
 
@@ -84,7 +95,7 @@ class JobDatabase:
         with self.connection:
             self.connection.executemany(
                 "DELETE FROM jobs WHERE key = ?",
-                [(f"{stage}:{property_id}",) for stage in ("summary", "detail")],
+                [(f"{stage}:{property_id}",) for stage in ("summary", "detail", "refresh")],
             )
             self.connection.execute(
                 "UPDATE jobs SET result = NULL WHERE key = ?", (f"import:{property_id}",)
@@ -135,8 +146,8 @@ class DownloadJobs(AsyncDatabase):
     async def refresh(self, property_id):
         await self._call("refresh", property_id)
 
-    async def enqueue(self, context):
-        await self._call("enqueue", context)
+    async def enqueue(self, context, refresh=False):
+        await self._call("enqueue", context, refresh)
 
     async def work(self):
         return await self._call("work")
