@@ -311,7 +311,7 @@ async def daemon(args):
         async def reviews():
             from .review import process_pending
 
-            return await process_pending(review_config, quiet=args.quiet, ready_only=True)
+            return await process_pending(review_config, quiet=args.quiet)
 
         return await run_pipeline(
             args, discovery, downloads, reviews if review_config is not None else None
@@ -389,7 +389,7 @@ def daemon_command(args):
 @click.option(
     "--dry-run",
     is_flag=True,
-    help="List live unprocessed IDs in this cycle without downloading images or calling the model.",
+    help="List ready, unprocessed IDs in this cycle without calling the model.",
 )
 @click.option("--quiet", is_flag=True)
 @click.option("--cron", help="Optional quoted five-field schedule for checking the archive.")
@@ -401,8 +401,8 @@ def daemon_command(args):
 def review_command_cli(args):
     """Review live unprocessed properties once with the Agents SDK.
 
-    Download missing archived gallery images before judging. By default, include
-    new arrivals until the queue is complete; --review-limit bounds the cycle.
+    Review complete stored galleries. By default, include
+    new ready arrivals until the queue is complete; --review-limit bounds the cycle.
 
     With --email-to, bundle passed/uncertain flats after every selected review
     completes. An empty queue or incomplete selected batch sends no email.

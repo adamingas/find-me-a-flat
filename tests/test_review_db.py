@@ -150,31 +150,23 @@ def test_incomplete_or_inactive_items_wait_and_completed_ids_stay_processed_acro
         property = replace(property, images=[*property.images, second_image])
         db.upsert_property(property)
         assert db.candidate_ids(PROFILE) == []
-        assert db.unprocessed_ids() == [1]
-        assert [row["source_url"] for row in db.pending_review_images(1)] == [
-            image.source_url for image in property.images
-        ]
+        assert db.unprocessed_ids() == []
         db.store_image(1, property.images[0], b"original image", "image/jpeg")
         assert db.claim_review(PROFILE, 1) is None
-        assert [row["download_status"] for row in db.pending_review_images(1)] == ["pending"]
+        assert db.unprocessed_ids() == []
         db.record_image_error(1, second_image.source_url, "503")
         assert db.candidate_ids(PROFILE) == []
-        assert db.pending_review_images(1)[0]["last_error"] == "503"
-        # A damaged downloaded reference also needs repair; restore it before
-        # continuing so the archive finishes with valid foreign keys.
+        db.store_image(1, second_image, b"bedroom image", "image/jpeg")
+        assert db.unprocessed_ids() == [1]
+        # A downloaded association whose BLOB is missing is not ready either.
         original_sha = hashlib.sha256(b"original image").hexdigest()
         db.connection.execute("PRAGMA foreign_keys = OFF")
         with db.connection:
             db.connection.execute("DELETE FROM image_blobs WHERE sha256 = ?", (original_sha,))
-        assert [row["download_status"] for row in db.pending_review_images(1)] == [
-            "downloaded",
-            "error",
-        ]
+        assert db.unprocessed_ids() == []
         db.store_image(1, property.images[0], b"original image", "image/jpeg")
         db.connection.execute("PRAGMA foreign_keys = ON")
-        db.store_image(1, second_image, b"bedroom image", "image/jpeg")
-        assert db.candidate_ids(PROFILE) == [1]
-        assert db.pending_review_images(1) == []
+        assert db.candidate_ids(PROFILE) == db.unprocessed_ids() == [1]
         review_id, snapshot = db.claim_review(PROFILE, 1)
         # Observation times and source markup are excluded from the fingerprint.
         db.upsert_property(
@@ -209,9 +201,11 @@ def test_incomplete_or_inactive_items_wait_and_completed_ids_stay_processed_acro
         db.upsert_property(replace(listing(4), images=[]))
         db.upsert_property(replace(listing(5), images=[], is_live=None))
         assert db.candidate_ids(PROFILE) == []
-        assert db.unprocessed_ids() == [2, 4, 5]
-        assert db.unprocessed_ids(limit=2) == [2, 4]
-        assert db.pending_review_images(4) == db.pending_review_images(99) == []
+        assert db.unprocessed_ids() == []
+        store_ready(db, listing(6))
+        store_ready(db, listing(7))
+        assert db.unprocessed_ids() == [6, 7]
+        assert db.unprocessed_ids(limit=1) == [6]
         for limit in (0, -1, True, 1.5, "2"):
             with pytest.raises(ValueError, match="positive integer"):
                 db.unprocessed_ids(limit)
@@ -258,12 +252,9 @@ def test_async_review_facade_uses_normal_archive_worker(tmp_path):
             property = listing()
             await db.register_profile(PROFILE, "bright flat", "example-model")
             await db.upsert_property(property)
-            assert await db.unprocessed_ids(limit=1) == [1]
-            assert [row["source_url"] for row in await db.pending_review_images(1)] == [
-                property.images[0].source_url
-            ]
+            assert await db.unprocessed_ids(limit=1) == []
             await db.store_image(1, property.images[0], b"photo", "image/jpeg")
-            assert await db.pending_review_images(1) == []
+            assert await db.unprocessed_ids(limit=1) == [1]
             assert await db.candidate_ids(PROFILE) == [1]
             review_id, snapshot = await db.claim_review(PROFILE, 1)
             assert snapshot.images[0].content == b"photo"

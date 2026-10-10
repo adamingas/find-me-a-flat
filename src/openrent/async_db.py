@@ -181,8 +181,6 @@ class AsyncDatabase:
         content_type: str,
         etag: str | None = None,
         last_modified: str | None = None,
-        *,
-        require_association: bool = False,
     ) -> bool:
         return await self._call(
             "store_image",
@@ -192,7 +190,6 @@ class AsyncDatabase:
             content_type,
             etag=etag,
             last_modified=last_modified,
-            require_association=require_association,
         )
 
     async def record_image_error(self, property_id: int, url: str, message: str) -> None:

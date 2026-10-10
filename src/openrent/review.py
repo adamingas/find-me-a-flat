@@ -7,17 +7,14 @@ import hashlib
 import math
 import os
 import shutil
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
-from .client import OpenRentClient
 from .judge import JudgeError, judge_property
 from .locking import ScanLock
 from .notifications import NotificationConfig, send_pending
 from .notifications import configuration as notification_configuration
 from .review_db import AsyncReviewDatabase
-from .review_images import prepare_gallery
 
 
 @dataclass(frozen=True)
@@ -78,9 +75,7 @@ def configuration(args) -> ReviewConfig:
     )
 
 
-async def process_pending(
-    config: ReviewConfig, *, quiet=False, dry_run=False, ready_only=False
-) -> int:
+async def process_pending(config: ReviewConfig, *, quiet=False, dry_run=False) -> int:
     if config.stop_after_pass and config.concurrency != 1:
         raise ValueError("--stop-after-pass requires --review-concurrency 1.")
     if config.stop_after_pass and config.notifications is not None:
@@ -96,11 +91,11 @@ async def process_pending(
     # decision is committed; a changed input remains unprocessed for retry.
     with ScanLock(Path(str(config.database.resolve()) + ".review")):
         async with AsyncReviewDatabase(config.database) as db:
-            ids = await db.unprocessed_ids(limit=config.limit, ready_only=ready_only)
+            ids = await db.unprocessed_ids(limit=config.limit)
             if dry_run:
                 print(
                     f"{len(ids)} unprocessed listings ready for review "
-                    "(live; missing gallery images will be downloaded).",
+                    "(live; complete stored galleries).",
                     flush=True,
                 )
                 for property_id in ids:
@@ -127,9 +122,8 @@ async def process_pending(
                         once_per_property=True,
                     )
                     if claimed is None:
-                        if property_id in await db.unprocessed_ids():
-                            totals["error"] += 1
-                            report(f"{property_id}: review evidence unavailable; left unprocessed.")
+                        totals["error"] += 1
+                        report(f"{property_id}: review evidence unavailable; left unprocessed.")
                         return
                     review_id, snapshot = claimed
                     try:
@@ -162,40 +156,26 @@ async def process_pending(
                         totals["error"] += 1
                         report(f"{property_id}: review failed; left unprocessed: {exc}")
 
-            async with nullcontext(None) if ready_only else OpenRentClient() as client:
-
-                async def prepare_and_assess(property_id):
-                    if not ready_only and not await prepare_gallery(
-                        db, property_id, client=client, report=report
-                    ):
-                        totals["error"] += 1
-                        return
-                    await assess(property_id)
-
-                while ids:
-                    attempted.update(ids)
-                    if config.stop_after_pass:
-                        for property_id in ids:
-                            await prepare_and_assess(property_id)
-                            if stopped.is_set():
-                                break
-                    else:
-                        tasks = [asyncio.create_task(prepare_and_assess(item)) for item in ids]
-                        try:
-                            await asyncio.gather(*tasks)
-                        finally:
-                            for task in tasks:
-                                task.cancel()
-                            await asyncio.gather(*tasks, return_exceptions=True)
-                    # A scanner may add properties while the current jobs run.
-                    # Drain fresh IDs, but leave failed attempts for the next run.
-                    if config.limit is not None or stopped.is_set():
-                        break
-                    ids = [
-                        item
-                        for item in await db.unprocessed_ids(ready_only=ready_only)
-                        if item not in attempted
-                    ]
+            while ids:
+                attempted.update(ids)
+                if config.stop_after_pass:
+                    for property_id in ids:
+                        await assess(property_id)
+                        if stopped.is_set():
+                            break
+                else:
+                    tasks = [asyncio.create_task(assess(item)) for item in ids]
+                    try:
+                        await asyncio.gather(*tasks)
+                    finally:
+                        for task in tasks:
+                            task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                # A scanner may add properties while the current jobs run.
+                # Drain fresh IDs, but leave failed attempts for the next run.
+                if config.limit is not None or stopped.is_set():
+                    break
+                ids = [item for item in await db.unprocessed_ids() if item not in attempted]
             print(
                 f"Reviews: {totals['pass']} pass, {totals['reject']} reject, "
                 f"{totals['uncertain']} uncertain, {totals['error']} failed.",
@@ -203,7 +183,7 @@ async def process_pending(
             )
             notification_result = 0
             if config.notifications is not None:
-                pending_ids = await db.unprocessed_ids(ready_only=ready_only)
+                pending_ids = await db.unprocessed_ids()
                 remaining = (
                     [item for item in pending_ids if item in attempted]
                     if config.limit is not None

@@ -23,13 +23,11 @@ Python's dedicated SQLite worker reads a consistent listing snapshot and every c
 
 The dossier uses existing stored fields and source feature rows; it does not ask an AI to select the facts. Conflicting claims remain visible, such as a bills flag disagreeing with the description. Reported nearby walking times are labelled as source values, including zero-minute values.
 
-An unbounded cycle includes every live, unprocessed property ID, even when its image bytes
-have not yet been downloaded. Bounded cycles prepare only their selected properties. Before
-judging, the review job downloads every missing gallery image from its
-already archived source URL and saves the original bytes to SQLite. Existing downloaded
-images are reused. Photographs, floorplans and maps are all supplied; there is no sampling.
-The model runs only after the complete gallery is available, with at least one photograph.
-A failed download leaves the property unprocessed and suppresses the end-of-cycle email.
+Review selects live, unprocessed properties with a complete stored gallery and at least
+one photograph. The downloader owns all OpenRent requests, including images. Review never
+fetches missing pictures; incomplete galleries wait until the downloader finishes them.
+Photographs, floorplans and maps are all supplied from SQLite, without sampling.
+`--review-limit` counts only ready properties, so an incomplete gallery does not use a slot.
 
 For **Codex**, Python creates a private temporary directory containing readable `listing.txt`, an `images.txt` manifest mapping image numbers to filenames and all numbered original gallery image files. Codex reads the dossier and uses its filesystem and image tools to inspect the supplied image paths. Those files remain available throughout the review and are removed afterward, including on failure or cancellation.
 
@@ -120,7 +118,7 @@ uv run openrent review \
   --review-backend responses --review-model MODEL_ID
 ```
 
-Inspect live, unprocessed IDs, including properties needing image downloads. Add
+Inspect live, unprocessed IDs whose galleries are ready for review. Add
 `--review-limit N` to preview only a bounded cycle:
 
 ```sh
@@ -130,9 +128,9 @@ uv run openrent review --db data/victoria.sqlite \
 
 A dry run can migrate the archive; it does not register a review profile, claim or process
 listings, download images or call a model, and needs no model credentials. Known
-unavailable listings are excluded. By default, normal runs include all live, unprocessed IDs,
-download missing galleries, then review them. Unbounded cycles check the archive again
-between batches to include new arrivals. Failed jobs remain retryable.
+unavailable listings and incomplete galleries are excluded. Normal runs use stored metadata
+and image bytes. Unbounded cycles check the archive again between batches to include new
+ready arrivals. Failed reviews remain retryable; pending downloads stay with the downloader.
 
 Use `--review-limit N` to select at most N properties for a bounded cycle. That cycle finishes
 when every selected property is reviewed; properties outside the selected batch remain
@@ -161,17 +159,16 @@ email cycle must finish its selected batch before producing the bundled digest.
 
 ## Review digest emails
 
-Supply one or more recipients with repeated `--email-to ADDRESS` flags. A cycle downloads
-missing gallery images and waits for every selected assessment to finish before sending one
-concise digest per recipient. An unbounded cycle covers all live, unprocessed IDs, including
-new arrivals; `--review-limit N` restricts it to at most N selected properties. Include their
+Supply one or more recipients with repeated `--email-to ADDRESS` flags. A cycle waits for
+every selected assessment to finish before sending one concise digest per recipient.
+An unbounded cycle covers all ready, live, unprocessed IDs, including new ready arrivals; `--review-limit N` restricts it to at most N selected properties. Include their
 **passed and uncertain** results that have not already been emailed to that recipient;
 exclude rejected flats. The sender is `notifications@flats.spanashis.com` and delivery uses
 Resend.
 
-If there are no live, unprocessed property IDs, the automatic cycle exits without an email.
-If any selected image download or assessment fails or remains incomplete, its property stays
-retryable and no partial digest is sent. Unprocessed properties outside a bounded cycle's
+If there are no ready, live, unprocessed property IDs, the cycle exits without an email.
+If any selected assessment fails or its evidence changes during review, its property stays
+retryable and no partial digest is sent. Galleries still downloading wait for a later cycle. Unprocessed properties outside a bounded cycle's
 selected batch do not suppress that batch's email.
 If the complete cycle has no unemailed passed or uncertain flats, there is no email.
 

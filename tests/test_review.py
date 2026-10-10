@@ -205,7 +205,6 @@ def test_daemon_reviews_independently_and_rejects_missing_images_before_discover
     async def process(cfg, **kwargs):
         events.append("review")
         assert cfg.backend == "responses" and cfg.model == "test-model"
-        assert kwargs["ready_only"] is True
         return 0
 
     monkeypatch.setattr(cli, "discover", discover)
@@ -298,22 +297,38 @@ def test_pipeline_cancellation_reaches_judge_and_leaves_listing_retryable(tmp_pa
         assert row[0] == "complete" and row[1] is not None and row[2] == "pass"
 
 
-def test_empty_gallery_stays_unprocessed_and_returns_failure_without_calling_judge(
-    tmp_path, monkeypatch, capsys
+@pytest.mark.parametrize("gallery", ["empty", "partial"])
+def test_review_skips_incomplete_galleries_until_downloaded_without_using_its_limit(
+    tmp_path, monkeypatch, gallery
 ):
     path = tmp_path / "archive.sqlite"
     add_listing(path, 1)
+    add_listing(path, 2)
     with Database(path) as db, db.connection:
-        db.connection.execute("DELETE FROM property_images WHERE property_id = 1")
+        if gallery == "empty":
+            db.connection.execute("DELETE FROM property_images WHERE property_id = 1")
+        else:
+            db.connection.execute(
+                "UPDATE property_images SET download_status = 'pending', content_sha256 = NULL "
+                "WHERE property_id = 1 AND position = 1"
+            )
+    calls = []
 
-    async def judge(*args, **kwargs):
-        raise AssertionError("A listing without photographs must not call the model")
+    async def judge(snapshot, images, criteria, **kwargs):
+        calls.append(snapshot["id"])
+        assert len(images) == 2
+        return judgement("pass")
 
     monkeypatch.setattr(review, "judge_property", judge)
-    assert asyncio.run(review.process_pending(config(path))) == 1
-    output = capsys.readouterr().out
-    assert "review evidence unavailable; left unprocessed" in output
-    assert "1 failed" in output
+    cfg = replace(config(path), limit=1)
+    assert asyncio.run(review.process_pending(cfg, quiet=True)) == 0
+    assert calls == [2]  # Incomplete ID 1 neither downloads nor consumes the limit.
     with ReviewDatabase(path) as db:
-        assert db.unprocessed_ids() == [1]
-        assert db.counts()["reviews_complete"] == 0
+        assert db.counts()["reviews_complete"] == 1
+        assert db.claim_review(cfg.profile_key, 1) is None
+    add_listing(path, 1)  # The downloader finishes the gallery before the next cycle.
+    assert asyncio.run(review.process_pending(cfg, quiet=True)) == 0
+    assert calls == [2, 1]
+    with ReviewDatabase(path) as db:
+        assert db.counts()["reviews_complete"] == 2
+        assert db.unprocessed_ids() == []

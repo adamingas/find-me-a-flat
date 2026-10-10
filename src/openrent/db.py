@@ -659,14 +659,11 @@ class Database:
         content_type: str,
         etag: str | None = None,
         last_modified: str | None = None,
-        *,
-        require_association: bool = False,
     ) -> bool:
         """Store actual image bytes, deduplicating content across listings and URLs.
 
         Returns False if this association already points to the same image bytes.
         Download headers belong to the source URL, rather than the shared blob.
-        With require_association, a URL removed during download stays removed.
         """
         if not content:
             raise ValueError("Cannot store an empty image")
@@ -676,15 +673,6 @@ class Database:
             self.connection.execute("BEGIN IMMEDIATE")
             if self.get_property(property_id) is None:
                 return False  # A concurrent deletion filter may have removed this listing.
-            if (
-                require_association
-                and self.connection.execute(
-                    "SELECT 1 FROM property_images WHERE property_id = ? AND source_url = ?",
-                    (property_id, image.source_url),
-                ).fetchone()
-                is None
-            ):
-                return False
             self._upsert_image(property_id, image, now)
             existing = self.connection.execute(
                 "SELECT * FROM property_images WHERE property_id = ? AND source_url = ?",

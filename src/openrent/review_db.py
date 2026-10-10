@@ -182,8 +182,8 @@ class ReviewDatabase(Database):
             is not None
         )
 
-    def unprocessed_ids(self, limit: int | None = None, ready_only=False) -> list[int]:
-        """Return live IDs with no completed review, including incomplete galleries."""
+    def unprocessed_ids(self, limit: int | None = None) -> list[int]:
+        """Return live, unreviewed IDs with a complete gallery and at least one photo."""
         if limit is not None and (
             not isinstance(limit, int) or isinstance(limit, bool) or limit < 1
         ):
@@ -194,36 +194,20 @@ class ReviewDatabase(Database):
             "AND NOT EXISTS (SELECT 1 FROM review.property_reviews r "
             "WHERE r.property_id = p.id AND r.status = 'complete') "
         )
-        if ready_only:
-            query += (
-                "AND EXISTS (SELECT 1 FROM main.property_images i "
-                "WHERE i.property_id = p.id AND i.kind = 'photo') "
-                "AND NOT EXISTS (SELECT 1 FROM main.property_images i "
-                "LEFT JOIN main.image_blobs b ON b.sha256 = i.content_sha256 "
-                "WHERE i.property_id = p.id AND "
-                "(i.download_status != 'downloaded' OR b.sha256 IS NULL)) "
-            )
-        query += "ORDER BY p.id"
+        query += (
+            "AND EXISTS (SELECT 1 FROM main.property_images i "
+            "WHERE i.property_id = p.id AND i.kind = 'photo') "
+            "AND NOT EXISTS (SELECT 1 FROM main.property_images i "
+            "LEFT JOIN main.image_blobs b ON b.sha256 = i.content_sha256 "
+            "WHERE i.property_id = p.id AND "
+            "(i.download_status != 'downloaded' OR b.sha256 IS NULL)) "
+            "ORDER BY p.id"
+        )
         parameters = () if limit is None else (limit,)
         if limit is not None:
             query += " LIMIT ?"
         with self._transaction(write=False):
             return [row[0] for row in self.connection.execute(query, parameters)]
-
-    def pending_review_images(self, property_id: int) -> list[dict[str, Any]]:
-        """Return image rows requiring download, including broken BLOB references."""
-        with self._transaction(write=False):
-            return [
-                dict(row)
-                for row in self.connection.execute(
-                    "SELECT i.* FROM main.property_images i "
-                    "LEFT JOIN main.image_blobs b ON b.sha256 = i.content_sha256 "
-                    "WHERE i.property_id = ? "
-                    "AND (i.download_status != 'downloaded' OR b.sha256 IS NULL) "
-                    "ORDER BY i.position, i.source_url",
-                    (property_id,),
-                )
-            ]
 
     def candidate_ids(
         self,
@@ -601,11 +585,8 @@ class AsyncReviewDatabase(AsyncDatabase):
     ) -> list[int]:
         return await self._call("candidate_ids", profile_key, once_per_property, limit)
 
-    async def unprocessed_ids(self, limit: int | None = None, ready_only=False) -> list[int]:
-        return await self._call("unprocessed_ids", limit, ready_only)
-
-    async def pending_review_images(self, property_id: int) -> list[dict[str, Any]]:
-        return await self._call("pending_review_images", property_id)
+    async def unprocessed_ids(self, limit: int | None = None) -> list[int]:
+        return await self._call("unprocessed_ids", limit)
 
     async def claim_review(
         self,
