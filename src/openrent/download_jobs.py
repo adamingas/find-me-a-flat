@@ -17,6 +17,12 @@ class JobDatabase:
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS jobs (key TEXT PRIMARY KEY, input BLOB, result BLOB)"
         )
+        self.connection.execute(
+            "INSERT OR IGNORE INTO jobs(key, input) "
+            "SELECT 'ready:' || substr(key, 8), ? FROM jobs "
+            "WHERE key LIKE 'import:%' AND input IS NOT NULL AND result IS NOT NULL",
+            (pickle.dumps(True),),
+        )
         self.connection.commit()
 
     def close(self):
@@ -46,6 +52,10 @@ class JobDatabase:
                 "ON CONFLICT(key) DO UPDATE SET result = excluded.result",
                 (f"import:{property_id}", pickle.dumps(True)),
             )
+            self.connection.execute(
+                "INSERT OR IGNORE INTO jobs(key, input) VALUES (?, ?)",
+                (f"ready:{property_id}", pickle.dumps(True)),
+            )
 
     def images(self, property_id):
         return [
@@ -56,23 +66,13 @@ class JobDatabase:
             )
         ]
 
-    def enqueue(self, context, refresh=False):
+    def enqueue(self, context):
         property_id = context[0].property.id
         with self.connection:
             self.connection.execute(
                 "INSERT OR IGNORE INTO jobs(key, input) VALUES (?, ?)",
                 (f"import:{property_id}", pickle.dumps(context)),
             )
-            if refresh:
-                self.connection.execute(
-                    "UPDATE jobs SET input = ? WHERE key = ?",
-                    (pickle.dumps(context), f"import:{property_id}"),
-                )
-                self.connection.execute(
-                    "INSERT INTO jobs(key, result) VALUES (?, ?) "
-                    "ON CONFLICT(key) DO UPDATE SET result = excluded.result",
-                    (f"refresh:{property_id}", pickle.dumps(True)),
-                )
 
     def work(self):
         return [
@@ -81,26 +81,13 @@ class JobDatabase:
                 "SELECT j.input FROM jobs j WHERE j.key LIKE 'import:%' AND j.input IS NOT NULL "
                 "AND (j.result IS NULL OR EXISTS (SELECT 1 FROM jobs i "
                 "WHERE i.key LIKE 'image:' || substr(j.key, 8) || ':%' AND i.result IS NULL) "
-                "OR EXISTS (SELECT 1 FROM jobs r WHERE r.key = 'refresh:' || substr(j.key, 8)))"
+                "OR EXISTS (SELECT 1 FROM jobs r "
+                "WHERE r.key = 'ready:' || substr(j.key, 8) AND r.result IS NULL))"
             )
         ]
 
     def discard_images(self, property_id):
         with self.connection:
-            self.connection.execute(
-                "DELETE FROM jobs WHERE key LIKE ?", (f"image:{property_id}:%",)
-            )
-
-    def refresh(self, property_id):
-        with self.connection:
-            self.connection.executemany(
-                "DELETE FROM jobs WHERE key = ?",
-                [(f"{stage}:{property_id}",) for stage in ("summary", "detail", "refresh")],
-            )
-            self.connection.execute(
-                "UPDATE jobs SET result = NULL WHERE key = ?", (f"import:{property_id}",)
-            )
-            # Remove obsolete gallery jobs; downloaded bytes remain in the listing DB.
             self.connection.execute(
                 "DELETE FROM jobs WHERE key LIKE ?", (f"image:{property_id}:%",)
             )
@@ -143,11 +130,8 @@ class DownloadJobs(AsyncDatabase):
     async def images(self, property_id):
         return await self._call("images", property_id)
 
-    async def refresh(self, property_id):
-        await self._call("refresh", property_id)
-
-    async def enqueue(self, context, refresh=False):
-        await self._call("enqueue", context, refresh)
+    async def enqueue(self, context):
+        await self._call("enqueue", context)
 
     async def work(self):
         return await self._call("work")

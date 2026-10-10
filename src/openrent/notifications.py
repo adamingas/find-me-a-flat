@@ -44,6 +44,7 @@ def _validate_preview_destination(db_path: Path, output: Path) -> None:
         ),
         Path(str(db_path) + ".scan.lock"),
         Path(str(db_path) + ".review.scan.lock"),
+        Path(str(db_path) + ".notify.scan.lock"),
     )
     for path in protected:
         if resolved_output == path.resolve() or (
@@ -78,8 +79,6 @@ def configuration(args) -> NotificationConfig | None:
         if preview.resolve() == env_file.resolve():
             raise ValueError("Email preview must not overwrite the environment file.")
         return NotificationConfig(recipients, preview=preview)
-    if getattr(args, "dry_run", False):
-        return NotificationConfig(recipients)
     if env_file.exists() and not env_file.is_file():
         raise ValueError("The environment file must be a regular file.")
     settings = dict(dotenv_values(env_file)) if env_file.is_file() else {}
@@ -95,19 +94,11 @@ async def send_pending(
     db: AsyncReviewDatabase,
     config: NotificationConfig,
     report=print,
-    *,
-    property_ids: set[int] | None = None,
 ) -> int:
-    """The caller holds the review lock throughout selection, sending and recording."""
-
-    async def eligible(recipient):
-        records = await db.pending_notifications(recipient)
-        if property_ids is not None:
-            records = [record for record in records if record["property_id"] in property_ids]
-        return records
+    """The caller holds the notification lock; review continues independently."""
 
     if config.preview is not None:
-        records = await eligible(config.recipients[0])
+        records = await db.pending_notifications(config.recipients[0])
         if not records:
             report("No new passed or uncertain flats to preview.")
             return 0
@@ -132,7 +123,7 @@ async def send_pending(
                 failures += 1
                 break
             if batch is None:
-                records = await eligible(recipient)
+                records = await db.pending_notifications(recipient)
                 if not records:
                     report(f"No new passed or uncertain flats to email to {recipient}.")
                     break
@@ -204,13 +195,8 @@ def _write_preview(path: Path, html: str) -> None:
     path.write_text(html, encoding="utf-8")
 
 
-async def notify_command(args) -> int:
-    if not args.db.is_file():
-        raise ValueError(f"Database does not exist: {args.db}")
-    config = configuration(args)
-    if config is None:
-        raise ValueError("Supply --email-to ADDRESS to send or preview a digest.")
-    report = print if not args.quiet else lambda _: None
-    with ScanLock(Path(str(args.db.resolve()) + ".review")):
-        async with AsyncReviewDatabase(args.db) as db:
+async def process_pending(database: Path, config: NotificationConfig, *, quiet=False) -> int:
+    report = (lambda _: None) if quiet else print
+    with ScanLock(Path(str(database.resolve()) + ".notify")):
+        async with AsyncReviewDatabase(database) as db:
             return await send_pending(db, config, report)

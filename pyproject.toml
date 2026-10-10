@@ -7,6 +7,7 @@ dependencies = [
     "beautifulsoup4>=4.13,<5",
     "click>=8.1,<9",
     "croniter>=6,<7",
+    "dbos>=3.2.0",
     "httpx>=0.28,<1",
     "openai-agents>=0.23.1,<1",
     "pillow>=11,<13",
@@ -28,13 +29,10 @@ packages = ["src/openrent"]
 
 [dependency-groups]
 dev = [
-    "hypothesis>=6,<7",
-    "pytest>=8,<10",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
     "ruff>=0.13,<1",
 ]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import shutil
 import tempfile
 from collections.abc import AsyncIterator, Sequence
@@ -36,19 +34,11 @@ class _EvidenceFiles:
     images: tuple[Path, ...]
 
 
-def _write_evidence(data: str | dict[str, Any], images: Sequence[ImageEvidence]) -> _EvidenceFiles:
+def _write_evidence(data: str, images: Sequence[ImageEvidence]) -> _EvidenceFiles:
     directory = Path(tempfile.mkdtemp(prefix="openrent-codex-"))
     try:
-        if isinstance(data, str):
-            metadata = directory / "listing.txt"
-            metadata.write_text(data, encoding="utf-8")
-        elif isinstance(data, dict):
-            metadata = directory / "metadata.json"
-            metadata.write_text(
-                json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2), encoding="utf-8"
-            )
-        else:
-            raise BackendError("Review data must be text or a dictionary")
+        metadata = directory / "listing.txt"
+        metadata.write_text(data, encoding="utf-8")
         suffixes = {
             "image/jpeg": ".jpg",
             "image/png": ".png",
@@ -56,34 +46,18 @@ def _write_evidence(data: str | dict[str, Any], images: Sequence[ImageEvidence])
             "image/gif": ".gif",
         }
         paths = []
-        gallery = []
         for number, picture in enumerate(images, 1):
             path = directory / f"image-{number:03d}{suffixes.get(picture.content_type, '.image')}"
             path.write_bytes(picture.content)
             paths.append(path)
-            gallery.append(
-                {
-                    "number": number,
-                    "path": str(path),
-                    "content_type": picture.content_type,
-                    "sha256": hashlib.sha256(picture.content).hexdigest(),
-                }
-            )
-        if isinstance(data, str):
-            manifest = directory / "images.txt"
-            manifest.write_text(
-                "\n\n".join(
-                    f"{image_label(picture, number, len(images))}\nPath: {path}"
-                    for number, (picture, path) in enumerate(zip(images, paths, strict=True), 1)
-                ),
-                encoding="utf-8",
-            )
-        else:
-            manifest = directory / "manifest.json"
-            manifest.write_text(
-                json.dumps({"metadata_path": str(metadata), "images": gallery}, indent=2),
-                encoding="utf-8",
-            )
+        manifest = directory / "images.txt"
+        manifest.write_text(
+            "\n\n".join(
+                f"{image_label(picture, number, len(images))}\nPath: {path}"
+                for number, (picture, path) in enumerate(zip(images, paths, strict=True), 1)
+            ),
+            encoding="utf-8",
+        )
         return _EvidenceFiles(directory, metadata, manifest, tuple(paths))
     except BaseException:
         shutil.rmtree(directory)
@@ -114,7 +88,7 @@ async def _remove_evidence(files: _EvidenceFiles) -> None:
 
 @asynccontextmanager
 async def _evidence_files(
-    data: str | dict[str, Any], images: Sequence[ImageEvidence]
+    data: str, images: Sequence[ImageEvidence]
 ) -> AsyncIterator[_EvidenceFiles]:
     operation = asyncio.get_running_loop().run_in_executor(None, _write_evidence, data, images)
     try:
@@ -170,7 +144,7 @@ class CodexBackend:
     def __init__(self, config: BackendConfig):
         self.config = config
 
-    async def run(self, data: str | dict[str, Any], images: Sequence[ImageEvidence]) -> BaseModel:
+    async def run(self, data: str, images: Sequence[ImageEvidence]) -> BaseModel:
         try:
             async with asyncio.timeout(self.config.timeout):
                 async with _evidence_files(data, images) as files:

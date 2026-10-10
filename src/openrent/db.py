@@ -15,7 +15,7 @@ from typing import Any, Self
 from . import filtering
 from .models import Feature, Image, Property
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 REVIEW_SCHEMA_VERSION = 4
 
 # Keep this explicit: a dataclass addition must be accompanied by a schema change.
@@ -69,23 +69,14 @@ PROPERTY_COLUMNS = (
     "source_html",
 )
 
-TABLES = (
-    "properties",
-    "property_images",
-    "image_blobs",
-    "property_features",
-    "nearby_places",
-    "media_links",
-)
-
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds")
 
 
-def review_path_for(path: str | Path) -> Path | None:
+def review_path_for(path: str | Path) -> Path:
     """Append to the resolved filename so different archive extensions cannot collide."""
-    return None if str(path) == ":memory:" else Path(str(Path(path).resolve()) + ".review.sqlite")
+    return Path(str(Path(path).resolve()) + ".review.sqlite")
 
 
 def _merge_metadata(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
@@ -109,10 +100,9 @@ class Database:
     """
 
     def __init__(self, path: str | Path):
-        self.path = Path(path) if str(path) != ":memory:" else None
+        self.path = Path(path)
         self.review_path = review_path_for(path)
-        if self.path is not None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(str(path), timeout=30)
         self.connection.row_factory = sqlite3.Row
         try:
@@ -125,7 +115,7 @@ class Database:
                 ) from exc
             self.connection.execute(
                 "ATTACH DATABASE ? AS review",
-                (str(self.review_path) if self.review_path is not None else ":memory:",),
+                (str(self.review_path),),
             )
             version = self.connection.execute("PRAGMA user_version").fetchone()[0]
             if version > SCHEMA_VERSION:
@@ -145,7 +135,7 @@ class Database:
                         mode = self.connection.execute(
                             f"PRAGMA {namespace}.journal_mode = DELETE"
                         ).fetchone()[0]
-                        if self.path is not None and mode != "delete":
+                        if mode != "delete":
                             raise ValueError(
                                 "Cannot obtain rollback journals for the schema migration."
                             )
@@ -419,12 +409,6 @@ class Database:
             )
         return deleted
 
-    def delete_properties(self, property_ids: list[int]) -> int:
-        """Atomically cascade property deletion and clean up their unreferenced BLOBs."""
-        with self.connection:
-            self.connection.execute("BEGIN IMMEDIATE")
-            return self._delete_properties(list(dict.fromkeys(property_ids)))
-
     def filter_properties(self, property_ids: list[int]) -> list[int]:
         """Evaluate saved facts and atomically delete rejected IDs from this scan only."""
         property_ids = list(dict.fromkeys(property_ids))
@@ -641,6 +625,24 @@ class Database:
             preserve_unknown=True,
         )
 
+    def publish_ready(self, property_id: int) -> None:
+        """The downloader alone publishes completed archives, including crash recovery."""
+        with self.connection:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO review_queue(property_id) "
+                "SELECT p.id FROM properties p "
+                "WHERE p.id = ? AND (p.is_live IS NULL OR p.is_live != 0) "
+                "AND EXISTS (SELECT 1 FROM property_images i "
+                "WHERE i.property_id = p.id AND i.kind = 'photo') "
+                "AND NOT EXISTS (SELECT 1 FROM property_images i "
+                "LEFT JOIN image_blobs b ON b.sha256 = i.content_sha256 "
+                "WHERE i.property_id = p.id AND "
+                "(i.download_status != 'downloaded' OR b.sha256 IS NULL)) "
+                "AND NOT EXISTS (SELECT 1 FROM review.property_reviews r "
+                "WHERE r.property_id = p.id AND r.status = 'complete')",
+                (property_id,),
+            )
+
     def image_downloaded(self, property_id: int, url: str) -> bool:
         return (
             self.connection.execute(
@@ -732,18 +734,3 @@ class Database:
                 },
                 now,
             )
-
-    def counts(self) -> dict[str, int]:
-        result = {
-            table: self.connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-            for table in TABLES
-        }
-        for status, name in (
-            ("downloaded", "downloaded_images"),
-            ("pending", "pending_images"),
-            ("error", "failed_images"),
-        ):
-            result[name] = self.connection.execute(
-                "SELECT count(*) FROM property_images WHERE download_status = ?", (status,)
-            ).fetchone()[0]
-        return result

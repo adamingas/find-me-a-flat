@@ -44,53 +44,15 @@ async def discover(args, client, jobs, api, website):
         for candidate in search.candidates
         if matches_criteria(api, website, candidate, search, reference_date=reference_date)
     ]
-    if args.sort == "rent-asc":
-        candidates.sort(key=lambda c: c.property.rent_pcm_pence or 0)
-    elif args.sort == "rent-desc":
-        candidates.sort(key=lambda c: c.property.rent_pcm_pence or 0, reverse=True)
-    elif args.sort == "newest":
-        candidates.sort(key=lambda c: c.property.first_listed_at or "", reverse=True)
-    else:
-        candidates.sort(
-            key=lambda c: c.commute_minutes if api.radius_minutes is not None else c.distance_km
-        )
-    log(
-        args,
-        f"{len(search.candidates)} candidates; {len(candidates)} match; importing all matches.",
-    )
-    if args.dry_run:
-        print(f"{len(candidates)} matches; database unchanged.")
-        for candidate in candidates:
-            prop = candidate.property
-            radius = (
-                f"{candidate.commute_minutes:g} min"
-                if api.radius_minutes is not None
-                else f"{candidate.distance_km:.2f} km"
-            )
-            print(
-                f"{prop.id}\t£{prop.rent_pcm_pence / 100:.2f}/month\t{radius}\t{BASE_URL}/{prop.id}"
-            )
-        return {}
-
+    log(args, f"{len(search.candidates)} candidates; {len(candidates)} match; queuing matches.")
     context = SearchData([], latitude=search.latitude, longitude=search.longitude)
-    fresh = {c.property.id: (c, api, website, context, reference_date) for c in candidates}
-    if jobs is not None:
-        for item in fresh.values():
-            await jobs.enqueue(item, refresh=args.refresh)
-    return fresh
+    for candidate in candidates:
+        await jobs.enqueue((candidate, api, website, context, reference_date, args.post_filter))
 
 
-async def drain(args, client, db, jobs, fresh=None):
+async def drain(args, client, db, jobs):
     new_properties = downloaded = errors = imported = filtered_out = 0
-    seen = []
-    work = {item[0].property.id: item for item in await jobs.work()}
-    # Manual fetches also revisit completed matches for a changed post-filter.
-    if args.refresh:
-        work.update(fresh or {})
-    else:
-        for property_id, item in (fresh or {}).items():
-            work.setdefault(property_id, item)
-    candidates = list(work.values())
+    candidates = await jobs.work()
     if not candidates:
         return 0
 
@@ -127,7 +89,8 @@ async def drain(args, client, db, jobs, fresh=None):
             jobs.release(key, lock)
 
     async def load(item):
-        candidate, saved_api, saved_website, saved_search, admitted_date = item
+        candidate, saved_api, saved_website, saved_search, admitted_date, *settings = item
+        post_filter = settings[0] if settings else getattr(args, "post_filter", False)
         nonlocal new_properties, imported, errors, filtered_out
         property_id = candidate.property.id
         if not await jobs.get(f"import:{property_id}"):
@@ -148,8 +111,6 @@ async def drain(args, client, db, jobs, fresh=None):
                         parse_property, detail.text, str(detail.url), candidate
                     )
                     await jobs.put(f"detail:{property_id}", prop)
-                if args.no_source_html:
-                    prop.source_html = None
                 current = Candidate(prop, candidate.distance_km, candidate.commute_minutes)
                 matches = matches_criteria(
                     saved_api,
@@ -166,7 +127,8 @@ async def drain(args, client, db, jobs, fresh=None):
                 if await db.get_property(property_id):
                     await db.upsert_property(prop)
                 await jobs.imported(property_id, [])
-                log(args, f"{property_id}: no longer matches after refreshing details.")
+                await jobs.put(f"ready:{property_id}", True)
+                log(args, f"{property_id}: does not match its saved filters.")
                 return
             inserted = await db.upsert_property(prop)
             new_properties += inserted
@@ -175,15 +137,18 @@ async def drain(args, client, db, jobs, fresh=None):
             imported += 1
             log(args, f"[{imported}/{len(candidates)}] {property_id}: {prop.title}")
         if await db.get_property(property_id):
-            seen.append(property_id)
-            if args.post_filter and not await db.filter_properties([property_id]):
+            if post_filter and not await db.filter_properties([property_id]):
                 filtered_out += 1
                 await jobs.discard_images(property_id)
+                await jobs.put(f"ready:{property_id}", True)
                 return
-            if not args.skip_images:
-                await gather_tasks(
-                    download(property_id, picture) for picture in await jobs.images(property_id)
-                )
+            await gather_tasks(
+                download(property_id, picture) for picture in await jobs.images(property_id)
+            )
+            if await jobs.images(property_id):
+                return
+            await db.publish_ready(property_id)
+        await jobs.put(f"ready:{property_id}", True)
 
     async def load_group(group):
         claims = []
@@ -193,9 +158,7 @@ async def drain(args, client, db, jobs, fresh=None):
                 lock = jobs.claim(candidate.property.id)
                 if lock is not None:
                     claims.append((item, lock))
-                    if await jobs.get(f"refresh:{candidate.property.id}"):
-                        await jobs.refresh(candidate.property.id)
-                    elif not await jobs.get(f"import:{candidate.property.id}"):
+                    if not await jobs.get(f"import:{candidate.property.id}"):
                         saved = await db.get_property(candidate.property.id)
                         if saved is not None and saved["source_html"]:
                             await jobs.imported(
@@ -223,17 +186,9 @@ async def drain(args, client, db, jobs, fresh=None):
     await gather_tasks(
         load_group(candidates[start : start + 20]) for start in range(0, len(candidates), 20)
     )
-    if args.post_filter:
-        log(
-            args,
-            f"Post-filter kept {len(seen) - filtered_out} listings; deleted {filtered_out}.",
-        )
-    counts = await db.counts()
-    filter_summary = f"Post-filter deleted {filtered_out}. " if args.post_filter else ""
     print(
         f"Imported {imported} properties ({new_properties} new); downloaded {downloaded} images; "
-        f"{errors} errors. {filter_summary}Database: {args.db.resolve()} "
-        f"({counts['properties']} properties, {counts['downloaded_images']} stored images).",
+        f"deleted {filtered_out}; {errors} errors. Database: {args.db.resolve()}",
         flush=True,
     )
     return 1 if errors else 0

@@ -151,16 +151,10 @@ CREATE TABLE IF NOT EXISTS media_links (
     PRIMARY KEY (property_id, url, kind)
 );
 
-CREATE VIEW IF NOT EXISTS property_summary AS
-SELECT p.id, p.url, p.title, p.address_display, p.locality, p.postcode,
-       p.latitude, p.longitude, p.property_type, p.bedrooms, p.bathrooms,
-       p.rent_pcm_pence, p.rent_pcm_pence / 100.0 AS rent_pcm,
-       p.rent_weekly_pence, p.deposit_pence, p.currency, p.available_from,
-       p.furnishing, p.pets_allowed, p.bills_included, p.is_live, p.status,
-       p.first_seen_at, p.last_seen_at, p.updated_at,
-       (SELECT count(*) FROM property_images i WHERE i.property_id = p.id) AS image_count,
-       (SELECT count(*) FROM property_images i
-        WHERE i.property_id = p.id AND i.download_status = 'downloaded') AS downloaded_image_count
-FROM properties p;
+DROP VIEW IF EXISTS property_summary;
 
-PRAGMA user_version = 6;
+CREATE TABLE IF NOT EXISTS review_queue (
+    property_id INTEGER PRIMARY KEY REFERENCES properties(id) ON DELETE CASCADE
+);
+
+PRAGMA user_version = 7;

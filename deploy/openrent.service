@@ -9,11 +9,11 @@ EnvironmentFile=%h/find-me-a-flat/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/.local/bin/uv run --locked --no-dev openrent daemon \
-    --cron "0 * * * *" --review-cron "*/10 * * * *" --run-now \
+    --cron "0 * * * *" --run-now \
     --location "Victoria Station, London" --radius-minutes 25 \
     --rent-min 2500 --rent-max 3600 --bedrooms-min 2 --filter \
-    --concurrency 1 --rps 0.2 --db data/flats.sqlite \
-    --criteria-file criteria.txt --review-backend codex
+    --concurrency 1 --requests-per-minute 12 --db data/flats.sqlite \
+    --criteria-file criteria.txt --review-backend codex --review-concurrency 3
 Restart=on-failure
 RestartSec=30
 TimeoutStopSec=60

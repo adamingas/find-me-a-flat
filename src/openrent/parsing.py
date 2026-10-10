@@ -719,7 +719,7 @@ def _sanitize_source(scope: Tag) -> str:
     return str(clone)
 
 
-def parse_property(html: str, url: str, candidate: Candidate | None = None) -> Property:
+def parse_property(html: str, url: str, candidate: Candidate) -> Property:
     """Parse a detail page, preserving normalized search metadata and public source HTML."""
     soup = BeautifulSoup(html, "html.parser")
     scope = soup.find("main") or soup.select_one(".listing") or soup.body or soup
@@ -729,12 +729,10 @@ def parse_property(html: str, url: str, candidate: Candidate | None = None) -> P
     if match is None:
         link = soup.select_one('a[href^="/messagelandlord/"]')
         match = re.search(r"/(\d+)", str(link.get("href"))) if link else None
-    if match is None and candidate is None:
-        raise ParseError("Cannot identify the OpenRent property ID on this detail page")
     property_id = int(match[1]) if match else candidate.property.id
-    if candidate and property_id != candidate.property.id:
+    if property_id != candidate.property.id:
         raise ParseError("Detail page property ID does not match its search candidate")
-    prop = copy.deepcopy(candidate.property) if candidate else Property(property_id, canonical_url)
+    prop = copy.deepcopy(candidate.property)
     prop.url = canonical_url
     title_node = scope.find("h1")
     title = _text(title_node)

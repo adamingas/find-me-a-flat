@@ -185,8 +185,3 @@ class JudgementOutput(BaseModel):
         if None in outcomes:
             return "uncertain"
         return "pass"
-
-    @property
-    def result(self) -> dict:
-        """The entire stored assessment, including local severity and verdict."""
-        return self.model_dump(mode="json")

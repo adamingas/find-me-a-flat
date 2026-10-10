@@ -4,23 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 from collections.abc import Sequence
 from typing import Any
 
 from agents import (
     Agent,
-    ModelSettings,
     OpenAIResponsesModel,
     RunConfig,
     Runner,
     WebSearchTool,
 )
 from agents.exceptions import AgentsException
-from openai import APIStatusError, AsyncOpenAI, AuthenticationError, OpenAIError
+from openai import APIStatusError, AuthenticationError, OpenAIError
 from pydantic import BaseModel, ValidationError
 
 from .backends import BackendConfig, BackendError, ImageEvidence, StructuredOutput, image_label
+from .model_config import OpenAIConfig
 
 
 async def _finish_cleanup(task: asyncio.Task) -> None:
@@ -41,7 +40,7 @@ async def _finish_cleanup(task: asyncio.Task) -> None:
 class ResponsesBackend:
     """Send all evidence in one model context with strict output and web search.
 
-    The OpenAI client authenticates using OPENAI_API_KEY. Archived image bytes
+    ModelConfig supplies the client credentials, endpoint and request settings. Archived image bytes
     become inline input_image data URLs, never paths or files. The model can use
     hosted web search but has no shell, filesystem, connector or handoff tools.
     """
@@ -49,20 +48,9 @@ class ResponsesBackend:
     def __init__(self, config: BackendConfig):
         self.config = config
 
-    async def run(self, data: str | dict, images: Sequence[ImageEvidence]) -> BaseModel:
+    async def run(self, data: str, images: Sequence[ImageEvidence]) -> BaseModel:
         config = self.config
-        if isinstance(data, str):
-            evidence = data
-        elif isinstance(data, dict):
-            try:
-                metadata = json.dumps(data, ensure_ascii=False, allow_nan=False, sort_keys=True)
-            except (TypeError, ValueError, RecursionError) as exc:
-                raise BackendError(
-                    "Review data must be JSON-serializable with finite values"
-                ) from exc
-            evidence = f"UNTRUSTED LISTING DATA (JSON):\n{metadata}"
-        else:
-            raise BackendError("Review data must be text or a dictionary")
+        evidence = data
         if len(evidence.encode()) + len(config.instructions.encode()) > 8 * 1024 * 1024:
             raise BackendError("Review data and instructions exceed 8 MiB; nothing was truncated")
 
@@ -77,9 +65,7 @@ class ResponsesBackend:
                 [
                     {
                         "type": "input_text",
-                        "text": image_label(image, number, len(images))
-                        if isinstance(data, str)
-                        else f"Image {number} of {len(images)}:",
+                        "text": image_label(image, number, len(images)),
                     },
                     {
                         "type": "input_image",
@@ -91,15 +77,23 @@ class ResponsesBackend:
 
         client = None
         try:
-            client = AsyncOpenAI(timeout=config.timeout, max_retries=0)
+            model_config = config.model_config or OpenAIConfig(config.model)
+            client = model_config.create_client(timeout=config.timeout)
+            # OpenRouter's Responses adapter rejects the SDK's null location.
+            # An empty approximate location preserves search without inventing a city.
+            search_options = (
+                {"user_location": {"type": "approximate"}}
+                if client.base_url.host == "openrouter.ai"
+                else {}
+            )
             agent = Agent(
                 name="Property review",
                 instructions=config.instructions,
                 model=OpenAIResponsesModel(model=config.model, openai_client=client),
-                tools=[WebSearchTool(external_web_access=True)],
+                tools=[WebSearchTool(external_web_access=True, **search_options)],
                 handoffs=[],
                 output_type=StructuredOutput(config.schema, strict_json_schema=True),
-                model_settings=ModelSettings(truncation="disabled", store=False),
+                model_settings=model_config.model_settings(),
             )
             async with asyncio.timeout(config.timeout):
                 result = await Runner.run(
@@ -117,12 +111,10 @@ class ResponsesBackend:
             ) from None
         except AuthenticationError:
             raise BackendError(
-                "OpenAI API authentication failed; configure OPENAI_API_KEY"
+                "Model API authentication failed; check the selected API credentials"
             ) from None
         except APIStatusError as exc:
-            raise BackendError(
-                f"OpenAI review request failed with HTTP {exc.status_code}"
-            ) from None
+            raise BackendError(f"Model review request failed with HTTP {exc.status_code}") from None
         except OpenAIError:
             raise BackendError(
                 "OpenAI review request failed; check API configuration and availability"

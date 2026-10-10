@@ -1,12 +1,10 @@
-"""uv-run command line interface and resilient, repeatable import orchestration."""
+"""Click entry points for the service and its durable queue consumers."""
 
 import asyncio
 import sqlite3
-import sys
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from functools import wraps
-from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,7 +13,7 @@ import click
 from .async_db import AsyncDatabase
 from .client import FetchError, OpenRentClient
 from .download_jobs import DownloadJobs
-from .ingestion import discover, drain
+from .ingestion import drain
 from .search import ApiFilters, SearchError, WebsiteFilters
 
 
@@ -37,7 +35,7 @@ def iso_date(value):
 
 
 def scan_flags(command):
-    """Apply the same Click options to manual and scheduled scans."""
+    """Filters for scheduled discovery."""
     options = [
         click.option(
             "--location",
@@ -100,45 +98,11 @@ def scan_flags(command):
                 help="Accept listings requiring at most this many months.",
             ),
             click.option(
-                "--sort",
-                type=click.Choice(["distance", "rent-asc", "rent-desc", "newest"]),
-                default="distance",
-            ),
-            click.option("--db", type=click.Path(path_type=Path), default=Path("openrent.sqlite")),
-            click.option("--skip-images", is_flag=True, help="Save image metadata without bytes."),
-            click.option("--refresh", is_flag=True, help="Fetch saved listing metadata again."),
-            click.option(
                 "--filter/--no-filter",
                 "post_filter",
                 default=False,
                 help="Delete imported listings unless Tube walk is at most 11 minutes and EPC is A/B/C. Default: off.",
             ),
-            click.option(
-                "--no-source-html", is_flag=True, help="Omit the sanitized listing HTML backup."
-            ),
-            click.option("--dry-run", is_flag=True, help="Show matches without creating a DB."),
-            click.option(
-                "--concurrency",
-                type=click.IntRange(1, 32),
-                default=1,
-                show_default=True,
-                help="Maximum simultaneous HTTP requests.",
-            ),
-            click.option("--timeout", type=float, default=30),
-            click.option(
-                "--requests-per-second",
-                "--rps",
-                type=click.FloatRange(min=0, min_open=True),
-                default=0.2,
-                show_default=True,
-                help="Maximum request start rate across pages, images, redirects and retries.",
-            ),
-            click.option(
-                "--cookie-file",
-                type=click.Path(path_type=Path),
-                help="Optional Netscape cookies exported from your own OpenRent session.",
-            ),
-            click.option("--quiet", is_flag=True),
         ]
     )
     for option in reversed(options):
@@ -146,8 +110,30 @@ def scan_flags(command):
     return command
 
 
+def request_flags(command):
+    for option in reversed(
+        [
+            click.option("--db", type=click.Path(path_type=Path), default=Path("openrent.sqlite")),
+            click.option(
+                "--requests-per-minute",
+                "--rpm",
+                type=click.FloatRange(min=0, min_open=True),
+                default=12,
+                show_default=True,
+                help="OpenRent request starts per minute, including retries.",
+            ),
+            click.option("--concurrency", type=click.IntRange(min=1), default=1, show_default=True),
+            click.option("--timeout", type=click.FloatRange(min=0, min_open=True), default=30),
+            click.option("--cookie-file", type=click.Path(path_type=Path)),
+            click.option("--quiet", is_flag=True),
+        ]
+    ):
+        command = option(command)
+    return command
+
+
 def email_flags(command):
-    """Recipients and provider settings shared by review and notify commands."""
+    """Email delivery settings for reviewed results."""
     options = [
         click.option(
             "--email-to",
@@ -165,11 +151,6 @@ def email_flags(command):
                 "or marking delivery."
             ),
         ),
-        click.option(
-            "--env-file",
-            type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
-            help="Read email credentials from this file; uses .env if present.",
-        ),
         click.option("--email-timeout", type=float, default=30, show_default=True),
     ]
     for option in reversed(options):
@@ -177,8 +158,16 @@ def email_flags(command):
     return command
 
 
+def env_file_flag(command):
+    return click.option(
+        "--env-file",
+        type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
+        help="Read credentials from this file; uses .env if present.",
+    )(command)
+
+
 def review_flags(*, required=False):
-    """Shared headless review settings for one-off and scheduled jobs."""
+    """Model settings shared by the service and queue consumer."""
 
     def decorate(command):
         options = [
@@ -201,37 +190,38 @@ def review_flags(*, required=False):
                 envvar="OPENRENT_REVIEW_MODEL",
                 help="Model name for the selected backend; must support images and structured output.",
             ),
+            click.option(
+                "--review-api",
+                type=click.Choice(["openai", "openrouter"]),
+                default="openai",
+                show_default=True,
+                envvar="OPENRENT_REVIEW_API",
+                help="Model API used by the responses backend.",
+            ),
+            click.option(
+                "--review-provider",
+                envvar="OPENRENT_REVIEW_PROVIDER",
+                help="OpenRouter provider slug, e.g. relace; pins routing without fallback.",
+            ),
             click.option("--review-timeout", type=float, default=300, show_default=True),
             click.option(
-                "--review-concurrency", type=click.IntRange(1, 4), default=1, show_default=True
+                "--review-concurrency", type=click.IntRange(min=1), default=1, show_default=True
             ),
             click.option(
                 "--review-limit",
                 type=click.IntRange(min=1),
-                help=(
-                    "Maximum properties in this cycle; email after every selected review completes."
-                ),
-            ),
-            click.option(
-                "--stop-after-pass",
-                is_flag=True,
-                help=(
-                    "Stop a review-only batch after its first pass; "
-                    "requires concurrency 1 and no email flags."
-                ),
+                help="Maximum ready flats selected per review pass.",
             ),
         ]
         for option in reversed(options):
             command = option(command)
-        return email_flags(command)
+        return env_file_flag(command)
 
     return decorate
 
 
 def scan_options(args):
     """Validate before opening a client or entering the daemon loop."""
-    if args.post_filter and args.dry_run:
-        raise SearchError("--filter requires saved detail metadata; omit --dry-run.")
     if args.radius_distance is None and args.radius_minutes is None:
         raise SearchError("Choose exactly one of --radius-distance or --radius-minutes.")
     values = vars(args) | {"property_types": args.property_types or None}
@@ -241,81 +231,21 @@ def scan_options(args):
     )
 
 
-async def fetch(args):
-    api, website = scan_options(args)
-    async with OpenRentClient(
-        timeout=args.timeout,
-        concurrency=args.concurrency,
-        requests_per_second=args.requests_per_second,
-        cookie_file=args.cookie_file,
-    ) as client:
-        fresh = await discover(args, client, None, api, website)
-        if args.dry_run:
-            return 0
-        async with AsyncDatabase(args.db) as db, DownloadJobs(args.db) as jobs:
-            for item in fresh.values():
-                await jobs.enqueue(item, refresh=args.refresh)
-            return await drain(args, client, db, jobs, fresh)
+async def download(args):
+    from .locking import ScanLock
 
-
-async def daemon(args):
-    from .daemon import run_daemon, run_pipeline, validate_schedule
-
-    api, website = scan_options(args)
-    validate_schedule(args.cron, args.timezone)
-    if args.review_cron:
-        validate_schedule(args.review_cron, args.timezone)
-        if args.criteria_file is None:
-            raise SearchError("--review-cron requires --criteria-file.")
-    if args.check_schedule:
-        return await run_daemon(args, None)
-
-    review_config = None
-    if (
-        (args.email_to or args.email_preview)
-        and args.criteria_file is None
-        and not args.check_schedule
-    ):
-        raise SearchError("Daemon email delivery requires --criteria-file to enable review.")
-    if args.criteria_file is not None and not args.check_schedule:
-        from .review import configuration
-
-        if args.skip_images:
-            raise SearchError("Suitability review needs downloaded images; omit --skip-images.")
-        review_config = configuration(args)
-
-    if args.dry_run:
-        return await run_daemon(args, fetch)
-
-    async with (
-        OpenRentClient(
-            timeout=args.timeout,
-            concurrency=args.concurrency,
-            requests_per_second=args.requests_per_second,
-            cookie_file=args.cookie_file,
-        ) as client,
-        AsyncDatabase(args.db) as db,
-        DownloadJobs(args.db) as jobs,
-    ):
-        fresh = {}
-
-        async def discovery():
-            fresh.update(await discover(args, client, jobs, api, website))
-            return 0
-
-        async def downloads():
-            current = fresh.copy()
-            fresh.clear()
-            return await drain(args, client, db, jobs, current)
-
-        async def reviews():
-            from .review import process_pending
-
-            return await process_pending(review_config, quiet=args.quiet)
-
-        return await run_pipeline(
-            args, discovery, downloads, reviews if review_config is not None else None
-        )
+    with ScanLock(args.db):
+        async with (
+            OpenRentClient(
+                timeout=args.timeout,
+                concurrency=args.concurrency,
+                requests_per_second=args.requests_per_minute / 60,
+                cookie_file=args.cookie_file,
+            ) as client,
+            AsyncDatabase(args.db) as db,
+            DownloadJobs(args.db) as jobs,
+        ):
+            return await drain(args, client, db, jobs)
 
 
 class InterruptedScan(click.ClickException):
@@ -344,125 +274,53 @@ def _invoke(command):
 
 @click.group(name="openrent", context_settings={"help_option_names": ["--help", "-h"]})
 def app():
-    """Fetch OpenRent listings and images into SQLite."""
-
-
-@app.command("fetch")
-@scan_flags
-@_invoke
-def fetch_command(args):
-    """Search and import listings with all listing images."""
-    return fetch(args)
+    """Archive and review OpenRent flats through durable queues."""
 
 
 @app.command("daemon")
 @scan_flags
+@request_flags
 @review_flags()
-@click.option("--cron", required=True, help="Quoted five-field UNIX cron expression.")
-@click.option("--review-cron", help="Independent review schedule; defaults to --cron.")
+@email_flags
 @click.option(
-    "--retry-interval",
-    type=click.FloatRange(min=0, min_open=True),
-    default=60,
-    show_default=True,
-    help="Seconds between passes retrying unfinished downloads.",
+    "--notify-cron-schedule",
+    help="Independent five-field cron schedule for emailing completed reviews.",
 )
+@click.option("--cron", required=True, help="Five-field cron schedule for discovering properties.")
 @click.option("--timezone", default="Europe/London", help="IANA schedule timezone.")
-@click.option("--run-now", is_flag=True, help="Discover and review immediately on startup.")
-@click.option(
-    "--max-runs",
-    type=click.IntRange(min=1),
-    help="Stop after N discoveries and a final download/review pass.",
-)
-@click.option(
-    "--check-schedule", is_flag=True, help="Print the next five discovery times without scanning."
-)
+@click.option("--run-now", is_flag=True, help="Discover immediately on startup as well.")
 @_invoke
 def daemon_command(args):
-    """Schedule discovery and review while continuously downloading queued work."""
-    return daemon(args)
+    """Schedule discovery and notification; continuously download and review."""
+    from .daemon import run_daemon
+
+    return run_daemon(args, *scan_options(args))
+
+
+@app.command("download")
+@request_flags
+@_invoke
+def download_command(args):
+    """Download unfinished queued metadata and images, then publish ready flats."""
+    return download(args)
 
 
 @app.command("review")
 @review_flags(required=True)
 @click.option("--db", type=click.Path(path_type=Path), default=Path("openrent.sqlite"))
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    help="List ready, unprocessed IDs in this cycle without calling the model.",
-)
-@click.option("--quiet", is_flag=True)
-@click.option("--cron", help="Optional quoted five-field schedule for checking the archive.")
-@click.option("--timezone", default="Europe/London")
-@click.option("--run-now", is_flag=True)
-@click.option("--max-runs", type=click.IntRange(min=1))
-@click.option("--check-schedule", is_flag=True)
-@_invoke
-def review_command_cli(args):
-    """Review live unprocessed properties once with the Agents SDK.
-
-    Review complete stored galleries. By default, include
-    new ready arrivals until the queue is complete; --review-limit bounds the cycle.
-
-    With --email-to, bundle passed/uncertain flats after every selected review
-    completes. An empty queue or incomplete selected batch sends no email.
-    """
-    from .review import review_command
-
-    return review_command(args)
-
-
-@app.command("notify")
-@email_flags
-@click.option("--db", type=click.Path(path_type=Path), default=Path("openrent.sqlite"))
 @click.option("--quiet", is_flag=True)
 @_invoke
-def notify_command_cli(args):
-    """Send or preview unemailed passed/uncertain stored reviews without another model run."""
-    from .notifications import notify_command
+def review_command(args):
+    """Consume ready flats once; the daemon runs this consumer continuously."""
+    from .review import configuration, process_pending
 
-    return notify_command(args)
-
-
-@app.command("review-schema")
-@_invoke
-def review_schema_command(args):
-    """Print the strict JSON output schema sent to the review model."""
-    import json
-
-    from .judge import judgement_schema
-
-    click.echo(json.dumps(judgement_schema(), indent=2, ensure_ascii=False))
+    return process_pending(configuration(args), quiet=args.quiet)
 
 
-@app.command("stats")
-@click.option("--db", type=click.Path(path_type=Path), default=Path("openrent.sqlite"))
-@_invoke
-def stats_command(args):
-    """Show stored listing and image counts."""
-    from .review_db import ReviewDatabase
-
-    if not args.db.is_file():
-        raise SearchError(f"Database does not exist: {args.db}")
-    with ReviewDatabase(args.db) as db:
-        for key, value in db.counts().items():
-            click.echo(f"{key}: {value}")
-
-
-@app.command("schema")
-@_invoke
-def schema_command(args):
-    """Print the normalized SQLite schema."""
-    click.echo(files("openrent").joinpath("schema.sql").read_text())
-
-
-def main(argv=None):
-    """Entry point returning exit codes, including the flags-only script invocation."""
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0].startswith("--") and arguments[0] not in ("--help", "-h"):
-        arguments.insert(0, "fetch")
+def main():
+    """Click entry point returning an exit code."""
     try:
-        result = app.main(args=arguments, prog_name="openrent", standalone_mode=False)
+        result = app.main(prog_name="openrent", standalone_mode=False)
         return 0 if result is None else result
     except click.ClickException as exc:
         exc.show()

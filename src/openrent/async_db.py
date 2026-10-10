@@ -167,8 +167,8 @@ class AsyncDatabase:
     async def filter_properties(self, property_ids: list[int]) -> list[int]:
         return await self._call("filter_properties", property_ids)
 
-    async def delete_properties(self, property_ids: list[int]) -> int:
-        return await self._call("delete_properties", property_ids)
+    async def publish_ready(self, property_id: int) -> None:
+        await self._call("publish_ready", property_id)
 
     async def image_downloaded(self, property_id: int, url: str) -> bool:
         return await self._call("image_downloaded", property_id, url)
@@ -194,6 +194,3 @@ class AsyncDatabase:
 
     async def record_image_error(self, property_id: int, url: str, message: str) -> None:
         await self._call("record_image_error", property_id, url, message)
-
-    async def counts(self) -> dict[str, int]:
-        return await self._call("counts")

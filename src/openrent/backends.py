@@ -11,6 +11,8 @@ from typing import Any, Protocol
 from agents import AgentOutputSchema
 from pydantic import BaseModel, ValidationError
 
+from .model_config import ModelConfig
+
 
 class BackendError(ValueError):
     """A backend could not produce a valid assessment."""
@@ -27,24 +29,13 @@ class BackendConfig:
     schema: type[BaseModel]
     instructions: str
     timeout: float = 300.0
-
-    def __post_init__(self):
-        if not isinstance(self.model, str) or not self.model.strip():
-            raise ValueError("An explicit model name is required.")
-        if not isinstance(self.instructions, str) or not self.instructions.strip():
-            raise ValueError("Instructions must contain nonblank text.")
-        if not isinstance(self.schema, type) or not issubclass(self.schema, BaseModel):
-            raise TypeError("Schema must be a Pydantic model class.")
-        if strict_schema(self.schema).get("type") != "object":
-            raise ValueError("Schema must describe a JSON object Pydantic model.")
-        if isinstance(self.timeout, bool) or not math.isfinite(self.timeout) or self.timeout <= 0:
-            raise ValueError("Timeout must be positive and finite.")
+    model_config: ModelConfig | None = None
 
 
 class AgentBackend(Protocol):
     config: BackendConfig
 
-    async def run(self, data: str | dict, images: Sequence[ImageEvidence]) -> BaseModel: ...
+    async def run(self, data: str, images: Sequence[ImageEvidence]) -> BaseModel: ...
 
 
 def image_label(image: ImageEvidence, number: int, total: int) -> str:

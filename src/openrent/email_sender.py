@@ -89,11 +89,8 @@ class ResendEmailSender:
     must remain reserved in local delivery tracking, including after that window.
     """
 
-    def __init__(
-        self, config: ResendEmailConfig, *, client: httpx.AsyncClient | None = None
-    ) -> None:
+    def __init__(self, config: ResendEmailConfig) -> None:
         self.config = config
-        self._client = client
 
     async def send(
         self,
@@ -124,8 +121,6 @@ class ResendEmailSender:
         }
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
-        if self._client is not None:
-            return await self._send(self._client, payload, headers)
         async with httpx.AsyncClient(follow_redirects=False) as client:
             return await self._send(client, payload, headers)
 
