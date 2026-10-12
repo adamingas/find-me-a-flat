@@ -1,194 +1,173 @@
-"""Scheduled discovery and resumable downloads using shared HTTP/SQLite resources."""
+"""Discovery, property downloads, and the durable handoff to AI review."""
 
 import asyncio
-import sys
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+from dbos import DBOS, SetWorkflowID
+
+from . import db as database
+from .amenities import MetadataFetcher, fetch_and_store_amenities
 from .client import BASE_URL, FetchError
-from .models import Candidate, SearchData
+from .commute import CommuteMetadataFetcher
+from .filtering import matches_post_filter, post_amenities_filter
+from .grocers import GrocerMetadataFetcher
+from .gyms import GymMetadataFetcher
+from .models import Candidate, Image, Property, SearchData
 from .parsing import enrich_summary, parse_property, parse_search
-from .search import SearchError, matches_criteria
+from .review import ReviewConfig, review_property
+from .runtime import resources
+from .search import ApiFilters, SearchError, WebsiteFilters, matches_criteria
+
+PROPERTY_QUEUE = "properties"
+REVIEW_QUEUE = "reviews"
+DISCOVERY_QUEUE = "discovery"
+NOTIFY_QUEUE = "notifications"
 
 
-def log(args, message):
-    if not args.quiet:
-        print(message, file=sys.stderr, flush=True)
+@dataclass(frozen=True)
+class DiscoveryConfig:
+    api: ApiFilters
+    website: WebsiteFilters
+    post_filter: bool = False
+    review: ReviewConfig | None = None
 
 
-async def gather_tasks(coroutines):
-    """Join tasks before closing shared resources, including on failure or cancellation."""
-    tasks = [asyncio.create_task(coroutine) for coroutine in coroutines]
-    try:
-        await asyncio.gather(*tasks)
-    finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-
-async def discover(args, client, jobs, api, website):
-    log(args, f"Searching {api.location} ...")
-    response = await client.search(api.parameters())
-    reference_date = datetime.now(ZoneInfo("Europe/London")).date()
+@DBOS.step(retries_allowed=True, max_attempts=3, interval_seconds=5)
+async def search_properties(config: DiscoveryConfig, reference_date: date) -> SearchData:
+    runtime = resources()
+    runtime.report(f"Searching {config.api.location} ...")
+    response = await runtime.client.search(config.api.parameters())
     search = await asyncio.to_thread(
         parse_search, response.text, str(response.url), reference_date=reference_date
     )
-    if api.radius_minutes is not None and "minute" not in (search.distance_unit or "").lower():
+    if (
+        config.api.radius_minutes is not None
+        and "minute" not in (search.distance_unit or "").lower()
+    ):
         raise SearchError(
-            "OpenRent returned distance results for this commute request. "
-            "Its travel-time search supports London locations; use --radius-distance elsewhere."
+            "OpenRent did not return commute results; use --radius-distance outside London."
         )
-    candidates = [
-        candidate
-        for candidate in search.candidates
-        if matches_criteria(api, website, candidate, search, reference_date=reference_date)
-    ]
-    log(args, f"{len(search.candidates)} candidates; {len(candidates)} match; queuing matches.")
-    context = SearchData([], latitude=search.latitude, longitude=search.longitude)
-    for candidate in candidates:
-        await jobs.enqueue((candidate, api, website, context, reference_date, args.post_filter))
+    return search
 
 
-async def drain(args, client, db, jobs):
-    new_properties = downloaded = errors = imported = filtered_out = 0
-    candidates = await jobs.work()
-    if not candidates:
-        return 0
-
-    async def download(property_id, picture):
-        nonlocal downloaded, errors
-        if await db.image_downloaded(property_id, picture.source_url):
-            await jobs.put(f"image:{property_id}:{picture.source_url}", True)
-            return
-        key, lock = await jobs.claim_image(picture.source_url)
+@DBOS.workflow()
+async def discover(scheduled_time: datetime, config: DiscoveryConfig) -> None:
+    reference_date = scheduled_time.astimezone(ZoneInfo("Europe/London")).date()
+    search = await search_properties(config, reference_date)
+    context = SearchData(
+        [],
+        latitude=search.latitude,
+        longitude=search.longitude,
+        location=search.location or config.api.location,
+    )
+    for candidate in search.candidates:
         try:
-            try:
-                response = await jobs.get(f"response:{picture.source_url}")
-                if response is None:
-                    response = await client.image(picture.source_url)
-                    await jobs.put(f"response:{picture.source_url}", response)
-            except FetchError as exc:
-                errors += 1
-                await db.record_image_error(property_id, picture.source_url, str(exc))
-                log(args, f"{property_id} image: {exc}")
-                return
-            content, mime, dimensions, headers = response
-            picture.width, picture.height = dimensions
-            stored = await db.store_image(
-                property_id,
-                picture,
-                content,
-                mime,
-                etag=headers.get("etag"),
-                last_modified=headers.get("last-modified"),
+            matches = matches_criteria(
+                config.api, config.website, candidate, search, reference_date=reference_date
             )
-            downloaded += stored
-            await jobs.put(f"image:{property_id}:{picture.source_url}", True)
-        finally:
-            jobs.release(key, lock)
-
-    async def load(item):
-        candidate, saved_api, saved_website, saved_search, admitted_date, *settings = item
-        post_filter = settings[0] if settings else getattr(args, "post_filter", False)
-        nonlocal new_properties, imported, errors, filtered_out
-        property_id = candidate.property.id
-        if not await jobs.get(f"import:{property_id}"):
-            try:
-                summary = await jobs.get(f"summary:{property_id}")
-                if summary is not None:
-                    try:
-                        enrich_summary(candidate, summary)
-                    except ValueError as exc:
-                        log(
-                            args,
-                            f"{property_id}: invalid summary; using detail page: {exc}",
-                        )
-                prop = await jobs.get(f"detail:{property_id}")
-                if prop is None:
-                    detail = await client.get(BASE_URL + f"/{property_id}")
-                    prop = await asyncio.to_thread(
-                        parse_property, detail.text, str(detail.url), candidate
-                    )
-                    await jobs.put(f"detail:{property_id}", prop)
-                current = Candidate(prop, candidate.distance_km, candidate.commute_minutes)
-                matches = matches_criteria(
-                    saved_api,
-                    saved_website,
-                    current,
-                    saved_search,
-                    reference_date=admitted_date,
+        except SearchError:
+            # Search summaries omit facts. Defer those candidates to the detail check.
+            matches = True
+        if matches:
+            with SetWorkflowID(f"property:{candidate.property.id}"):
+                await DBOS.enqueue_workflow_async(
+                    PROPERTY_QUEUE, download_property, candidate, config, context, reference_date
                 )
-            except (FetchError, ValueError) as exc:
-                errors += 1
-                log(args, f"{property_id}: {exc}")
-                return
-            if not matches:
-                if await db.get_property(property_id):
-                    await db.upsert_property(prop)
-                await jobs.imported(property_id, [])
-                await jobs.put(f"ready:{property_id}", True)
-                log(args, f"{property_id}: does not match its saved filters.")
-                return
-            inserted = await db.upsert_property(prop)
-            new_properties += inserted
-            # The output is committed before completing import and publishing image jobs.
-            await jobs.imported(property_id, prop.images)
-            imported += 1
-            log(args, f"[{imported}/{len(candidates)}] {property_id}: {prop.title}")
-        if await db.get_property(property_id):
-            if post_filter and not await db.filter_properties([property_id]):
-                filtered_out += 1
-                await jobs.discard_images(property_id)
-                await jobs.put(f"ready:{property_id}", True)
-                return
-            await gather_tasks(
-                download(property_id, picture) for picture in await jobs.images(property_id)
+
+
+@DBOS.step(retries_allowed=True, max_attempts=3, interval_seconds=5)
+async def fetch_property(candidate: Candidate) -> Property:
+    runtime = resources()
+    property_id = candidate.property.id
+    try:
+        for summary in await runtime.client.summaries([property_id]):
+            enrich_summary(candidate, summary)
+    except (FetchError, ValueError, TypeError) as exc:
+        runtime.report(f"{property_id}: summary unavailable; using detail page: {exc}")
+    response = await runtime.client.get(BASE_URL + f"/{property_id}")
+    return await asyncio.to_thread(parse_property, response.text, str(response.url), candidate)
+
+
+@DBOS.step()
+async def store_property(
+    property: Property, commute_minutes: float | None, target: SearchData
+) -> None:
+    db = resources().db
+    if commute_minutes is not None:
+        property = replace(
+            property,
+            openrent_commute_minutes=commute_minutes,
+            search_target=target.location,
+            search_target_latitude=target.latitude,
+            search_target_longitude=target.longitude,
+        )
+    await database.upsert_property(db, property)
+
+
+@DBOS.step(retries_allowed=True, max_attempts=3, interval_seconds=5)
+async def fetch_amenities(property: Property) -> None:
+    runtime = resources()
+    fetchers: tuple[MetadataFetcher, ...] = (
+        GymMetadataFetcher(runtime.amenity_client),
+        GrocerMetadataFetcher(runtime.amenity_client),
+    )
+    for fetcher in fetchers:
+        await fetch_and_store_amenities(runtime.db, property, fetcher)
+
+
+@DBOS.step()
+async def fetch_commute(property: Property, target: SearchData) -> None:
+    """Optional journey information must not prevent downloads or review."""
+    if not target.location or target.latitude is None or target.longitude is None:
+        return
+    runtime = resources()
+    if runtime.amenity_client is None:
+        raise RuntimeError("Amenity HTTP client has not been configured")
+    fetcher = CommuteMetadataFetcher(
+        runtime.amenity_client, target.location, target.latitude, target.longitude
+    )
+    try:
+        await fetch_and_store_amenities(runtime.db, property, fetcher)
+    except FetchError as exc:
+        runtime.report(f"{property.id}: public transport estimate unavailable: {exc}")
+
+
+@DBOS.step(retries_allowed=True, max_attempts=3, interval_seconds=5)
+async def download_image(property_id: int, image: Image) -> None:
+    """Checkpoint one download and archive write; no other image progress state."""
+    runtime = resources()
+    content, mime, dimensions, _ = await runtime.client.image(image.source_url)
+    image.width, image.height = dimensions
+    await database.store_image(runtime.db, property_id, image, content, mime)
+
+
+@DBOS.workflow()
+async def download_property(
+    candidate: Candidate, config: DiscoveryConfig, context: SearchData, reference_date: date
+) -> str:
+    property = await fetch_property(candidate)
+    current = Candidate(property, candidate.distance_km, candidate.commute_minutes)
+    if not matches_criteria(
+        config.api, config.website, current, context, reference_date=reference_date
+    ) or (config.post_filter and not matches_post_filter(property)):
+        return "filtered"
+    await store_property(property, current.commute_minutes, context)
+    await fetch_amenities(property)
+    if not await post_amenities_filter(property.id):
+        return "filtered"
+    await fetch_commute(property, context)
+    results = await asyncio.gather(
+        *(download_image(property.id, image) for image in property.images),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    if config.review is not None:
+        with SetWorkflowID(f"review:{property.id}"):
+            await DBOS.enqueue_workflow_async(
+                REVIEW_QUEUE, review_property, property.id, config.review
             )
-            if await jobs.images(property_id):
-                return
-            await db.publish_ready(property_id)
-        await jobs.put(f"ready:{property_id}", True)
-
-    async def load_group(group):
-        claims = []
-        try:
-            for item in group:
-                candidate = item[0]
-                lock = jobs.claim(candidate.property.id)
-                if lock is not None:
-                    claims.append((item, lock))
-                    if not await jobs.get(f"import:{candidate.property.id}"):
-                        saved = await db.get_property(candidate.property.id)
-                        if saved is not None and saved["source_html"]:
-                            await jobs.imported(
-                                candidate.property.id,
-                                await db.get_images(candidate.property.id),
-                            )
-            missing = [
-                item[0].property.id
-                for item, _ in claims
-                if not await jobs.get(f"import:{item[0].property.id}")
-                and await jobs.get(f"summary:{item[0].property.id}") is None
-            ]
-            if missing:
-                try:
-                    summaries = await client.summaries(missing)
-                    for summary in summaries:
-                        await jobs.put(f"summary:{int(summary['id'])}", summary)
-                except (FetchError, ValueError, TypeError) as exc:
-                    log(args, f"Summary API unavailable; fetching detail pages: {exc}")
-            await gather_tasks(load(item) for item, _ in claims)
-        finally:
-            for item, lock in claims:
-                jobs.release(item[0].property.id, lock)
-
-    await gather_tasks(
-        load_group(candidates[start : start + 20]) for start in range(0, len(candidates), 20)
-    )
-    print(
-        f"Imported {imported} properties ({new_properties} new); downloaded {downloaded} images; "
-        f"deleted {filtered_out}; {errors} errors. Database: {args.db.resolve()}",
-        flush=True,
-    )
-    return 1 if errors else 0
+    return "downloaded"

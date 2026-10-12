@@ -1,4 +1,4 @@
-"""Click entry points for the service and its durable queue consumers."""
+"""Click entry point for the DBOS service."""
 
 import asyncio
 import sqlite3
@@ -10,10 +10,7 @@ from types import SimpleNamespace
 
 import click
 
-from .async_db import AsyncDatabase
-from .client import FetchError, OpenRentClient
-from .download_jobs import DownloadJobs
-from .ingestion import drain
+from .client import FetchError
 from .search import ApiFilters, SearchError, WebsiteFilters
 
 
@@ -101,7 +98,7 @@ def scan_flags(command):
                 "--filter/--no-filter",
                 "post_filter",
                 default=False,
-                help="Delete imported listings unless Tube walk is at most 11 minutes and EPC is A/B/C. Default: off.",
+                help="Require a Tube walk of at most 11 minutes and EPC A/B/C before downloading images.",
             ),
         ]
     )
@@ -167,7 +164,7 @@ def env_file_flag(command):
 
 
 def review_flags(*, required=False):
-    """Model settings shared by the service and queue consumer."""
+    """Review model settings."""
 
     def decorate(command):
         options = [
@@ -207,11 +204,6 @@ def review_flags(*, required=False):
             click.option(
                 "--review-concurrency", type=click.IntRange(min=1), default=1, show_default=True
             ),
-            click.option(
-                "--review-limit",
-                type=click.IntRange(min=1),
-                help="Maximum ready flats selected per review pass.",
-            ),
         ]
         for option in reversed(options):
             command = option(command)
@@ -229,23 +221,6 @@ def scan_options(args):
         model(**{name: values[name] for name in model.__dataclass_fields__})
         for model in (ApiFilters, WebsiteFilters)
     )
-
-
-async def download(args):
-    from .locking import ScanLock
-
-    with ScanLock(args.db):
-        async with (
-            OpenRentClient(
-                timeout=args.timeout,
-                concurrency=args.concurrency,
-                requests_per_second=args.requests_per_minute / 60,
-                cookie_file=args.cookie_file,
-            ) as client,
-            AsyncDatabase(args.db) as db,
-            DownloadJobs(args.db) as jobs,
-        ):
-            return await drain(args, client, db, jobs)
 
 
 class InterruptedScan(click.ClickException):
@@ -274,7 +249,7 @@ def _invoke(command):
 
 @click.group(name="openrent", context_settings={"help_option_names": ["--help", "-h"]})
 def app():
-    """Archive and review OpenRent flats through durable queues."""
+    """Discover, archive, review and notify through durable DBOS workflows."""
 
 
 @app.command("daemon")
@@ -295,26 +270,6 @@ def daemon_command(args):
     from .daemon import run_daemon
 
     return run_daemon(args, *scan_options(args))
-
-
-@app.command("download")
-@request_flags
-@_invoke
-def download_command(args):
-    """Download unfinished queued metadata and images, then publish ready flats."""
-    return download(args)
-
-
-@app.command("review")
-@review_flags(required=True)
-@click.option("--db", type=click.Path(path_type=Path), default=Path("openrent.sqlite"))
-@click.option("--quiet", is_flag=True)
-@_invoke
-def review_command(args):
-    """Consume ready flats once; the daemon runs this consumer continuously."""
-    from .review import configuration, process_pending
-
-    return process_pending(configuration(args), quiet=args.quiet)
 
 
 def main():

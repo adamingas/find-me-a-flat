@@ -1,26 +1,25 @@
 # Reviewing completed flats
 
-Review consumes the explicit ready queue populated by the downloader. It does not discover
-flats, check download progress, fetch photographs, or schedule itself. The model adapter
-reads the queued flat's archived dossier and local gallery evidence. The model's structured
-assessment is stored with its audit trail; completed IDs are removed from the queue.
+The property workflow gathers one durable download step per image and enqueues review
+after every step succeeds. Review reads the archived dossier and local gallery, checkpoints
+the structured AI assessment and digest facts, then saves the review and eligible
+notification item in one transaction.
+Interrupting the archive write does not repeat a successfully checkpointed AI call.
 
-The daemon runs review continuously alongside discovery and downloading. The `review`
-command consumes one existing queue pass. `--review-concurrency` sets the independent
-limit on simultaneous agents; `--review-limit` bounds the number selected per pass.
-Failures and interruptions remain retryable. Successful reviews are not repeated for the
-same property ID after criteria or model changes.
+`--review-concurrency` limits simultaneous agents through a separate DBOS queue. Successful
+reviews are not repeated for the same property ID after criteria or model changes. There is
+no application processing status or review queue table; DBOS tracks unfinished execution.
 
 ## Model configuration
 
-Both daemon and review accept:
+The daemon accepts:
 
 - `--criteria-file FILE`: UTF-8 instructions for the model.
 - `--review-backend codex|responses`: Codex CLI login or a model API.
 - `--review-model MODEL`: alternatively `OPENRENT_REVIEW_MODEL`.
 - `--review-api openai|openrouter`: API for the Responses backend.
 - `--review-provider PROVIDER`: optional OpenRouter provider slug; pins routing without fallback.
-- `--review-timeout SECONDS`, `--review-concurrency N`, `--review-limit N`.
+- `--review-timeout SECONDS`, `--review-concurrency N`.
 - `--env-file FILE`: model API credentials; defaults to `.env` when present.
 
 Codex requires the Codex CLI installed and authenticated. The Responses backend uses
@@ -30,12 +29,14 @@ Environment credentials take precedence over file credentials. `OPENRENT_REVIEW_
 
 `model_config.py` defines the `ModelConfig` protocol and its OpenAI/OpenRouter implementations.
 They supply asynchronous clients and Agents SDK settings. OpenRouter checks the selected
-model/provider's advertised image and strict structured-output capabilities before claiming
-queued flats. A provider that lacks either capability fails before a review starts. API keys
-are excluded from configuration representations and audit identity.
+model/provider's advertised image and strict structured-output capabilities before invoking
+the agent. A provider that lacks either capability fails before a review starts. API keys
+are resolved inside steps and excluded from durable workflow inputs.
 
 ```sh
-uv run openrent review --db data/flats.sqlite --criteria-file criteria.txt \
+uv run openrent daemon --cron '0 * * * *' --run-now \
+  --location 'Victoria Station, London' --radius-minutes 25 \
+  --db data/flats.sqlite --criteria-file criteria.txt \
   --review-backend responses --review-api openrouter --review-model MODEL_ID \
   --review-provider PROVIDER_SLUG --env-file .env --review-concurrency 3
 ```
@@ -47,16 +48,17 @@ pass/reject/uncertain locally. Unknown facts remain unknown in the result.
 
 ## Delivery
 
-Notification is an independent async task in the daemon. Add
+Notification is an independently scheduled DBOS workflow. Add
 `--notify-cron-schedule '0 9 * * *' --email-to ADDRESS` (repeat for multiple recipients),
 and set `RESEND_TOKEN` in the environment or the file supplied with `--env-file`.
 The cron uses `--timezone`, defaulting to Europe/London. Notification starts at its next
 scheduled tick; `--run-now` applies only to discovery.
 
-Each tick sends completed passed or uncertain reviews that have not been sent to the
-recipient, using the saved assessment and gallery links. Pending or failed reviews do
-not block delivery. Review has no notification configuration, sending code or email flags.
-Notification also works with review disabled, sending previously stored results.
+Each tick sends prepared outbox items that have not been sent to the recipient. The payload
+contains the assessment, digest facts and gallery URLs, without image bytes. Notification
+does not load the property dossier, inspect download state or query DBOS system tables.
+Review has no recipient configuration or sending code. Notification also works with review
+disabled, sending previously queued items.
 The verified sender is `notifications@flats.spanashis.com`.
 
 `--email-preview FILE` renders the digest for one recipient without sending or recording

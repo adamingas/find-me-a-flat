@@ -1,0 +1,45 @@
+[
+  {
+    "i": 0,
+    "id": 2865841,
+    "letAgreed": false,
+    "title": "1 Bed Flat, London, WC2N",
+    "description": "Spacious & Stylish 1-Bedroom Flat \u2013 Central London Looking for a comfortable, move-in ready place in the heart of Londo                               ",
+    "imageUrl": "//imagescdn.openrent.co.uk/listings/2493409/o_1iru2pva619qv4gnhva10r6e5jb.JPG_homepage.JPG",
+    "details": [
+      "1 Bed",
+      "1 Bath",
+      "Furnished"
+    ],
+    "distance": 0.0,
+    "commuteTime": 0.0,
+    "rentPerMonth": 2850.0,
+    "rentPerWeek": 657.6923582840276,
+    "lastUpdated": "around 5 days ago",
+    "isNew": false,
+    "isMultiRoom": false,
+    "maxRoomRentPerMonth": 0.0,
+    "maxRoomRentPerWeek": 0.0
+  },
+  {
+    "i": 1,
+    "id": 2870098,
+    "letAgreed": false,
+    "title": "Studio Flat, Craven Street, WC2N",
+    "description": "A gorgeous and spacious studio flat is now available to rent, fully furnished. All bills are included, except for council t                           ",
+    "imageUrl": "//imagescdn.openrent.co.uk/listings/2870098/o_1jmnpl9rs4rr8e58hq1grl1f191.JPG_homepage.JPG",
+    "details": [
+      "1 Bath",
+      "Furnished"
+    ],
+    "distance": 0.0,
+    "commuteTime": 0.0,
+    "rentPerMonth": 2700.0,
+    "rentPerWeek": 623.0769710059209,
+    "lastUpdated": "around 1 week ago",
+    "isNew": false,
+    "isMultiRoom": false,
+    "maxRoomRentPerMonth": 0.0,
+    "maxRoomRentPerWeek": 0.0
+  }
+]

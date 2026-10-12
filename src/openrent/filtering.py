@@ -1,30 +1,30 @@
-"""Hard-coded post-fetch rules over the saved archive. Edit this function to add rules."""
+"""Additional rules over downloaded metadata. Edit here to add rules."""
 
-import sqlite3
-from itertools import batched
+from dbos import DBOS
+
+from . import db as database
+from .models import Property
+from .runtime import resources
 
 
-def filter_property_ids(connection: sqlite3.Connection, property_ids: list[int]) -> list[int]:
-    """Return input IDs with EPC A/B/C and a Tube walk of at most 11 minutes.
+def matches_post_filter(property: Property) -> bool:
+    """Require EPC A/B/C and an Underground walk of at most 11 minutes."""
+    return (property.epc_rating or "").strip().upper() in {"A", "B", "C"} and any(
+        place.kind == "underground"
+        and place.walking_minutes is not None
+        and place.walking_minutes <= 11
+        for place in property.nearby_places
+    )
 
-    The connection exposes all stored columns and related tables. This function
-    only reads them; the database layer deletes rejected IDs after it returns.
-    Missing walking times or EPC ratings do not satisfy the rules. EPC letters
-    are compared without surrounding whitespace and regardless of case.
-    """
-    property_ids = list(dict.fromkeys(property_ids))
-    passing = set()
-    for batch in batched(property_ids, 500):
-        placeholders = ",".join("?" for _ in batch)
-        passing.update(
-            row[0]
-            for row in connection.execute(
-                "SELECT DISTINCT p.id FROM properties p "
-                "JOIN nearby_places n ON n.property_id = p.id "
-                f"WHERE p.id IN ({placeholders}) "
-                "AND UPPER(TRIM(p.epc_rating)) IN ('A', 'B', 'C') "
-                "AND n.kind = 'underground' AND n.walking_minutes <= 11",
-                batch,
-            )
-        )
-    return [property_id for property_id in property_ids if property_id in passing]
+
+@DBOS.step()
+async def post_amenities_filter(property_id: int) -> bool:
+    """Require a gym with a walking time strictly below thirteen minutes."""
+    rows = await database.query(
+        resources().db,
+        "SELECT COALESCE(MIN(json_extract(g.value, '$.walking_seconds')) < 13 * 60, 0) AS passes "
+        "FROM amenities a CROSS JOIN json_each(a.data, '$.gyms') g "
+        "WHERE a.property_id = ? AND a.type = 'gym'",
+        (property_id,),
+    )
+    return bool(rows[0]["passes"])

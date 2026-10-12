@@ -4,10 +4,11 @@ version = "0.1.0"
 description = "Import OpenRent rental listings and full-size photographs into SQLite."
 requires-python = ">=3.12"
 dependencies = [
+    "aiosqlite>=0.22,<1",
     "beautifulsoup4>=4.13,<5",
     "click>=8.1,<9",
     "croniter>=6,<7",
-    "dbos>=3.2.0",
+    "dbos>=3.2,<4",
     "httpx>=0.28,<1",
     "openai-agents>=0.23.1,<1",
     "pillow>=11,<13",
@@ -29,6 +30,7 @@ packages = ["src/openrent"]
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.168.5",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.13,<1",

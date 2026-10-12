@@ -1,62 +1,102 @@
-"""Scheduled discovery and notification, with independent download/review consumers."""
+"""Own shared resources and configure independent DBOS discovery/digest schedules."""
 
 import asyncio
 import signal
-import sqlite3
-from datetime import datetime
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import UTC, datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from croniter import croniter
+from dbos import DBOS
 
-from .async_db import AsyncDatabase
-from .client import FetchError, OpenRentClient
-from .download_jobs import DownloadJobs
-from .ingestion import discover, drain, log
+from . import db as database
+from .amenity_client import AmenityClient
+from .client import OpenRentClient
+from .ingestion import (
+    DISCOVERY_QUEUE,
+    NOTIFY_QUEUE,
+    PROPERTY_QUEUE,
+    REVIEW_QUEUE,
+    DiscoveryConfig,
+    discover,
+)
 from .locking import ScanLock
+from .notifications import NotificationSettings, notify
 from .notifications import configuration as notification_configuration
-from .notifications import process_pending as notify
-from .review import configuration, process_pending
+from .review import configuration as review_configuration
+from .runtime import Runtime, configure
+
+
+def system_path_for(database):
+    return Path(str(database.resolve()) + ".dbos.sqlite")
+
+
+async def register_queues(concurrency, review_concurrency):
+    for name, workers in (
+        (DISCOVERY_QUEUE, 1),
+        (PROPERTY_QUEUE, concurrency),
+        (REVIEW_QUEUE, review_concurrency),
+        (NOTIFY_QUEUE, 1),
+    ):
+        await DBOS.register_queue_async(name, worker_concurrency=workers)
+
+
+def schedule_inputs(args, discovery, notification):
+    entries = [
+        {
+            "schedule_name": "discover",
+            "workflow_fn": discover,
+            "schedule": args.cron,
+            "context": discovery,
+            "cron_timezone": args.timezone,
+            "queue_name": DISCOVERY_QUEUE,
+        }
+    ]
+    if notification is not None:
+        entries.append(
+            {
+                "schedule_name": "notify",
+                "workflow_fn": notify,
+                "schedule": args.notify_cron_schedule,
+                "context": notification,
+                "cron_timezone": args.timezone,
+                "queue_name": NOTIFY_QUEUE,
+            }
+        )
+    return entries
 
 
 async def run_daemon(args, api, website):
-    try:
-        timezone = ZoneInfo(args.timezone)
-    except ZoneInfoNotFoundError as exc:
-        raise ValueError(f"Unknown timezone: {args.timezone}") from exc
+    ZoneInfo(args.timezone)
     for expression in (args.cron, args.notify_cron_schedule):
-        if expression is not None:
-            if len(expression.split()) != 5:
-                raise ValueError("Cron schedules must contain five fields.")
-            croniter(expression, datetime.now(timezone))
-    if (args.email_to or args.email_preview) and not args.notify_cron_schedule:
+        if expression is not None and (
+            len(expression.split()) != 5 or not croniter.is_valid(expression)
+        ):
+            raise ValueError("Cron schedules must contain five valid fields.")
+    configured_notification = notification_configuration(args)
+    if configured_notification is not None and not args.notify_cron_schedule:
         raise ValueError("Email delivery requires --notify-cron-schedule.")
-    notify_config = notification_configuration(args)
-    if args.notify_cron_schedule and notify_config is None:
+    if args.notify_cron_schedule and configured_notification is None:
         raise ValueError("--notify-cron-schedule requires --email-to.")
-    review_config = configuration(args) if args.criteria_file else None
-
-    async def attempt(operation):
-        try:
-            await operation()
-        except (FetchError, ValueError, sqlite3.Error, OSError) as exc:
-            log(args, f"{exc}; work remains queued for retry.")
-
-    async def consume(operation):
-        while True:
-            await attempt(operation)
-            await asyncio.sleep(5)
-
-    async def scheduled(operation, expression, *, run_now=False):
-        if run_now:
-            await attempt(operation)
-        while True:
-            next_tick = croniter(expression, datetime.now(timezone)).get_next(datetime)
-            await asyncio.sleep(max(0, next_tick.timestamp() - datetime.now(timezone).timestamp()))
-            await attempt(operation)
-
-    task = asyncio.current_task()
+    discovery = DiscoveryConfig(
+        api,
+        website,
+        args.post_filter,
+        review_configuration(args) if args.criteria_file else None,
+    )
+    notification = None
+    if configured_notification is not None:
+        notification = NotificationSettings(
+            args.db.resolve(),
+            configured_notification.recipients,
+            configured_notification.preview.resolve() if configured_notification.preview else None,
+            args.email_timeout,
+            Path(args.env_file or ".env").resolve(),
+        )
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
     try:
         with ScanLock(args.db):
             async with (
@@ -66,34 +106,46 @@ async def run_daemon(args, api, website):
                     requests_per_second=args.requests_per_minute / 60,
                     cookie_file=args.cookie_file,
                 ) as client,
-                AsyncDatabase(args.db) as db,
-                DownloadJobs(args.db) as jobs,
-                asyncio.TaskGroup() as tasks,
+                database.connect(args.db) as db,
+                AmenityClient(timeout=max(60, args.timeout)) as amenity_client,
             ):
-                tasks.create_task(
-                    scheduled(
-                        lambda: discover(args, client, jobs, api, website),
-                        args.cron,
-                        run_now=args.run_now,
-                    ),
-                    name="discovery",
-                )
-                tasks.create_task(consume(lambda: drain(args, client, db, jobs)), name="download")
-                if review_config:
-                    tasks.create_task(
-                        consume(lambda: process_pending(review_config, quiet=args.quiet)),
-                        name="review",
+                configure(Runtime(client, db, args.quiet, amenity_client))
+                dbos = None
+                try:
+                    dbos = DBOS(
+                        config={
+                            "name": "openrent",
+                            "system_database_url": f"sqlite:///{system_path_for(args.db)}",
+                            "log_level": "WARNING" if args.quiet else "INFO",
+                        }
                     )
-                if notify_config:
-                    tasks.create_task(
-                        scheduled(
-                            lambda: notify(args.db, notify_config, quiet=args.quiet),
-                            args.notify_cron_schedule,
-                        ),
-                        name="notify",
-                    )
-    except asyncio.CancelledError:
-        log(args, "Service stopped; unfinished work remains queued.")
+                    # Launch on this event loop so queued async work shares the client and limiter.
+                    DBOS.launch()
+                    await register_queues(args.concurrency, args.review_concurrency)
+                    await DBOS.apply_schedules_async(schedule_inputs(args, discovery, notification))
+                    if notification is None:
+                        await DBOS.delete_schedule_async("notify")
+                    if args.run_now:
+                        await DBOS.enqueue_workflow_async(
+                            DISCOVERY_QUEUE, discover, datetime.now(UTC), discovery
+                        )
+                    await stop.wait()
+                finally:
+                    # DBOS 3.2 adopts our main loop but destroy() only cancels its
+                    # own background loop. Stop its pollers, then cancel and join
+                    # main-loop work before destroy closes its executor/database.
+                    if dbos is not None:
+                        for event in dbos.background_thread_stop_events:
+                            event.set()
+                    tasks = [
+                        task for task in asyncio.all_tasks() if task is not asyncio.current_task()
+                    ]
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    await asyncio.to_thread(DBOS.destroy)
+                    configure(None)
     finally:
-        loop.remove_signal_handler(signal.SIGTERM)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.remove_signal_handler(sig)
     return 0

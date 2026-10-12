@@ -6,6 +6,7 @@ import html
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 from urllib.parse import urlsplit
@@ -21,6 +22,7 @@ class DigestListing:
     url: str
     property_data: Mapping[str, Any]
     review_result: Mapping[str, Any]
+    additional_info_html: str = ""
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,26 @@ def _victoria_distance(data: Mapping[str, Any], coordinates: tuple[float, float]
     return f"{_number(distance)} km (straight-line)" if distance is not None else "Unknown"
 
 
+def _commute_fact(data: Mapping[str, Any]) -> tuple[str, str] | None:
+    commute = (data.get("amenities") or {}).get("commute")
+    if not commute:
+        return None
+    label = "Public transport to " + _compact(commute.get("target"), 100)
+    duration = commute.get("duration_minutes")
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(duration)
+        or duration < 0
+    ):
+        return label, "Unavailable (TfL)"
+    value = f"{_number(duration)} min including walking (TfL)"
+    if commute.get("arrive_by"):
+        arrival = datetime.fromisoformat(commute["arrive_by"])
+        value += f"; arrive by {arrival:%a %d %b %Y, %H:%M}"
+    return label, value
+
+
 def _rent(data: Mapping[str, Any]) -> str:
     amount = data.get("rent_pcm_pence")
     if isinstance(amount, bool) or not isinstance(amount, int):
@@ -172,10 +194,10 @@ def _review_rows(result: Mapping[str, Any]) -> list[tuple[str, str, str]]:
 
 
 def _boolean_result(value: Any) -> str:
-    """Render strict booleans and preserve older archived outcomes without migrating them."""
-    if value is True or value == "met":
+    """Render the current boolean assessment format."""
+    if value is True:
         return "True"
-    if value is False or value == "not_met":
+    if value is False:
         return "False"
     return "Unknown"
 
@@ -342,6 +364,9 @@ def render_digest(
             ("Nearest reported Tube", _nearest_tube(data.get("nearby_places") or ())),
             ("Distance to Victoria", _victoria_distance(data, victoria_coordinates)),
         ]
+        commute = _commute_fact(data)
+        if commute is not None:
+            facts.append(commute)
         summary = _compact(result.get("summary"), 450)
         decision = {"pass": "Accepted", "reject": "Rejected", "uncertain": "Uncertain"}.get(
             str(result.get("decision")), "Unknown"
@@ -352,6 +377,7 @@ def render_digest(
             f'<h2 style="font-size:19px;margin:24px 0 12px">{number}. {linked_title}</h2>'
             + gallery
             + _table(facts)
+            + listing.additional_info_html
             + f'<p style="margin:12px 0"><strong>{html.escape(decision)}.</strong> '
             + html.escape(summary)
             + "</p>"
@@ -367,7 +393,8 @@ def render_digest(
             + "\n".join(f"{label}: {outcome} — {evidence}" for label, outcome, evidence in rows)
         )
     note = (
-        "Transport figures are from the listing. Straight-line distance is not walking distance. "
+        "Tube walking figures are from the listing; public transport journeys are from TfL. "
+        "Straight-line distance is not walking distance. "
         "Evidence may be shortened; the archive keeps the complete review."
     )
     document = (

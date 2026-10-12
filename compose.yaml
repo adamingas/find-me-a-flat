@@ -1,0 +1,70 @@
+name: openrent
+
+services:
+  overpass:
+    image: wiktorn/overpass-api@sha256:5f643f2aa500333f19458fe8be14457215d6e0b9f891ca5c5ed452b1f8882c47
+    restart: always
+    # The API worker runs as nginx and needs access through the image's /db home directory.
+    post_start:
+      - command: ["chmod", "0755", "/db"]
+        user: root
+    ports:
+      - "127.0.0.1:8003:80"
+    volumes:
+      - overpass-data:/db
+    environment:
+      OVERPASS_MODE: init
+      OVERPASS_META: "no"
+      OVERPASS_PLANET_URL: https://download.geofabrik.de/europe/united-kingdom/england/greater-london-latest.osm.pbf
+      OVERPASS_PLANET_PREPROCESS: >-
+        mv /db/planet.osm.bz2 /db/planet.osm.pbf &&
+        osmium cat -o /db/planet.osm.bz2 /db/planet.osm.pbf &&
+        rm /db/planet.osm.pbf
+      OVERPASS_DIFF_URL: https://download.geofabrik.de/europe/united-kingdom/england/greater-london-updates/
+      OVERPASS_UPDATE_SLEEP: "86400"
+      OVERPASS_STOP_AFTER_INIT: "false"
+      OVERPASS_USE_AREAS: "false"
+      OVERPASS_ALLOW_DUPLICATE_QUERIES: "yes"
+    cpus: 4
+    mem_limit: 6g
+    healthcheck:
+      test: ["CMD", "/app/docker-healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  valhalla:
+    image: ghcr.io/valhalla/valhalla-scripted@sha256:5d571a3e4c3b9ece838359fbaa12995ef70508093354c1685228fe35f841499d
+    restart: always
+    ports:
+      - "127.0.0.1:8002:8002"
+    volumes:
+      - valhalla-data:/custom_files
+    environment:
+      tile_urls: https://download.geofabrik.de/europe/united-kingdom/england/greater-london-latest.osm.pbf
+      server_threads: "2"
+      build_elevation: "False"
+      build_transit: "False"
+    cpus: 2
+    mem_limit: 4g
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8002/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  overpass-data:
+  valhalla-data:

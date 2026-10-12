@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
@@ -228,6 +229,10 @@ def render_listing(snapshot: Mapping[str, Any], images: Sequence[ImageEvidence])
     if extras:
         lines.extend(["", "Other source facts:"])
         lines.extend(_nested("Additional listing data", extras))
+    consumed.add("amenities")
+    lines.extend(
+        ["", "Amenities (JSON):", json.dumps(snapshot.get("amenities", {}), ensure_ascii=False)]
+    )
     for key, value in snapshot.items():
         if key not in consumed and key != "images":
             lines.extend(_nested(_label(key), value))

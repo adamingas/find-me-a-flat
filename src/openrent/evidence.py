@@ -27,10 +27,19 @@ class ReviewSnapshot:
     images: tuple[ArchivedImage, ...]
 
 
-def load_evidence(connection, property_id: int) -> ReviewSnapshot:
-    row = connection.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
+async def load_evidence(connection, property_id: int) -> ReviewSnapshot:
+    row = await _fetch_one(connection, "SELECT * FROM properties WHERE id = ?", (property_id,))
+    if row is None:
+        raise ValueError(f"Property {property_id} is missing from the archive")
     data = dict(row)
     data["extra_metadata"] = json.loads(data.pop("extra_metadata_json"))
+    data["amenities"] = {
+        item["type"]: json.loads(item["data"])
+        for item in await connection.execute_fetchall(
+            "SELECT type, json(data) AS data FROM amenities WHERE property_id = ? ORDER BY type",
+            (property_id,),
+        )
+    }
     for name, ordering in (
         ("property_features", "section, feature_key"),
         ("nearby_places", "kind, name"),
@@ -38,23 +47,24 @@ def load_evidence(connection, property_id: int) -> ReviewSnapshot:
     ):
         data[name.removeprefix("property_")] = [
             dict(item)
-            for item in connection.execute(
-                f"SELECT * FROM {name} WHERE property_id = ? ORDER BY {ordering}",
-                (property_id,),
+            for item in await connection.execute_fetchall(
+                f"SELECT * FROM {name} WHERE property_id = ? ORDER BY {ordering}", (property_id,)
             )
         ]
-    gallery = connection.execute(
-        "SELECT i.*, b.content_type, b.byte_length, b.content FROM property_images i "
-        "LEFT JOIN image_blobs b ON b.sha256 = i.content_sha256 "
-        "WHERE i.property_id = ? ORDER BY i.position, i.source_url",
+    gallery = await connection.execute_fetchall(
+        (
+            "SELECT i.*, b.content_type, b.byte_length, b.content FROM property_images i LEFT JOIN "
+            "image_blobs b ON b.sha256 = i.content_sha256 WHERE i.property_id = ? ORDER BY "
+            "i.position, i.source_url"
+        ),
         (property_id,),
-    ).fetchall()
+    )
+    if any(image["content"] is None for image in gallery):
+        raise ValueError(f"Property {property_id} has missing image content")
     data["images"] = [
         {name: image[name] for name in dict(image) if name != "content"} for image in gallery
     ]
-    # The model gets the entire archive row and related metadata. Observation
-    # timestamps and HTML backups do not change the substantive evidence
-    # fingerprint when a scanner refreshes the same listing concurrently.
+    # Observation timestamps and HTML backups do not change the review evidence.
     fingerprint_data = {
         name: value
         for name, value in data.items()
@@ -62,21 +72,11 @@ def load_evidence(connection, property_id: int) -> ReviewSnapshot:
     }
     for name in ("features", "nearby_places", "media_links", "images"):
         fingerprint_data[name] = [
-            {
-                key: value
-                for key, value in item.items()
-                if key
-                not in _OBSERVATION_COLUMNS
-                | {"downloaded_at", "etag", "last_modified", "last_error"}
-            }
+            {key: value for key, value in item.items() if key not in _OBSERVATION_COLUMNS}
             for item in data[name]
         ]
     canonical = json.dumps(
-        fingerprint_data,
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
+        fingerprint_data, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False
     )
     fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     images = tuple(
@@ -92,3 +92,8 @@ def load_evidence(connection, property_id: int) -> ReviewSnapshot:
         for image in gallery
     )
     return ReviewSnapshot(property_id, fingerprint, data, images)
+
+
+async def _fetch_one(connection, sql, parameters=()):
+    async with connection.execute(sql, parameters) as cursor:
+        return await cursor.fetchone()

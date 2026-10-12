@@ -58,6 +58,10 @@ class Property:
     country: str = "GB"
     latitude: float | None = None
     longitude: float | None = None
+    openrent_commute_minutes: float | None = None
+    search_target: str | None = None
+    search_target_latitude: float | None = None
+    search_target_longitude: float | None = None
     bedrooms: int | None = None
     bathrooms: int | None = None
     max_tenants: int | None = None
