@@ -239,10 +239,11 @@ def _gallery_images(data: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _gallery(listing: DigestListing, url: str | None) -> tuple[str, str]:
-    """A native scrolling carousel with a visible listing link as the email-client fallback.
+    """Render a vertically stacked gallery with fragment navigation.
 
-    No script, radio input or hidden initial image is needed. Fragment controls
-    work in browser previews; email clients may strip them or scrolling styles.
+    Email clients commonly strip scrolling styles, so each image stays visible
+    and Previous/Next links use plain in-document anchors to jump between them.
+    Named anchors are included for clients that do not honor element IDs.
     """
     images = _gallery_images(listing.property_data)
     listing_link = (
@@ -286,8 +287,8 @@ def _gallery(listing: DigestListing, url: str | None) -> tuple[str, str]:
         )
         slides.append(
             f'<figure id="{prefix}{index}" class="flat-gallery-slide" '
-            'style="display:inline-block;vertical-align:top;width:100%;max-width:740px;'
-            'margin:0;white-space:normal;scroll-snap-align:start">'
+            'style="display:block;width:100%;max-width:740px;margin:0 0 16px">'
+            f'<a name="{prefix}{index}"></a>'
             + picture
             + '<figcaption style="padding:8px;font-size:12px;text-align:center">'
             + controls
@@ -296,15 +297,13 @@ def _gallery(listing: DigestListing, url: str | None) -> tuple[str, str]:
     gallery = (
         '<div class="flat-gallery" role="group" aria-label="Listing image gallery" '
         'style="margin:12px 0 18px">'
-        '<div class="flat-gallery-track" style="width:100%;max-width:740px;overflow-x:auto;'
-        "overflow-y:hidden;white-space:nowrap;scroll-snap-type:x mandatory;"
-        'scroll-behavior:smooth;border:1px solid #ddd">'
+        '<div class="flat-gallery-track" style="width:100%;max-width:740px">'
         + "".join(slides)
         + "</div>"
         + '<p style="margin:8px 0;font-size:12px;color:#666">'
         + f"{count} archived images. "
         + (listing_link + ". " if listing_link else "")
-        + "Swipe or use Previous/Next where supported.</p></div>"
+        + "Use Previous/Next to jump between images.</p></div>"
     )
     return gallery, f"Gallery: {count} archived images; view the full gallery on the listing."
 

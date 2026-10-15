@@ -114,6 +114,24 @@ async def test_fixed_filter_uses_nearest_gym_and_strict_thirteen_minute_limit(pi
 
 
 @pytest.mark.asyncio
+async def test_fixed_filter_rejects_only_known_tfl_commutes_over_thirty_minutes(pipeline):
+    cases = [(None, True), (0, True), (29, True), (30, True), (31, False)]
+    for property_id, (minutes, expected) in enumerate(cases, 1):
+        await database.upsert_property(
+            pipeline.db, replace(listing(property_id), openrent_commute_minutes=45)
+        )
+        await database.store_amenity(pipeline.db, property_id, "gym", json.dumps(gym_payload(284)))
+        await database.store_amenity(
+            pipeline.db,
+            property_id,
+            "commute",
+            json.dumps({"target": "Victoria", "duration_minutes": minutes}),
+        )
+        handle = await DBOS.start_workflow_async(filter_property, property_id)
+        assert await handle.get_result() is expected
+
+
+@pytest.mark.asyncio
 async def test_leisure_centre_is_found_and_routes_are_assigned_by_target_index():
     centre = {
         "type": "way",

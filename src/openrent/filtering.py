@@ -19,12 +19,15 @@ def matches_post_filter(property: Property) -> bool:
 
 @DBOS.step()
 async def post_amenities_filter(property_id: int) -> bool:
-    """Require a gym with a walking time strictly below thirteen minutes."""
+    """Require a gym below thirteen minutes and reject known commutes over thirty."""
     rows = await database.query(
         resources().db,
-        "SELECT COALESCE(MIN(json_extract(g.value, '$.walking_seconds')) < 13 * 60, 0) AS passes "
+        "SELECT COALESCE(MIN(json_extract(g.value, '$.walking_seconds')) < 13 * 60, 0) "
+        "AND NOT EXISTS (SELECT 1 FROM amenities c "
+        "WHERE c.property_id = ? AND c.type = 'commute' "
+        "AND json_extract(c.data, '$.duration_minutes') > 30) AS passes "
         "FROM amenities a CROSS JOIN json_each(a.data, '$.gyms') g "
         "WHERE a.property_id = ? AND a.type = 'gym'",
-        (property_id,),
+        (property_id, property_id),
     )
     return bool(rows[0]["passes"])

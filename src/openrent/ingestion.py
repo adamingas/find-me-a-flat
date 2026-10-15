@@ -155,9 +155,9 @@ async def download_property(
         return "filtered"
     await store_property(property, current.commute_minutes, context)
     await fetch_amenities(property)
+    await fetch_commute(property, context)
     if not await post_amenities_filter(property.id):
         return "filtered"
-    await fetch_commute(property, context)
     results = await asyncio.gather(
         *(download_image(property.id, image) for image in property.images),
         return_exceptions=True,

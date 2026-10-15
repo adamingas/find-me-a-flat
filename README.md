@@ -57,7 +57,8 @@ completion marker or ready queue.
 
 The property workflow always fetches amenities after the existing filters pass, then runs
 `post_amenities_filter` from `filtering.py` before images or review. Its current rule requires
-a gym less than 13 minutes away on foot. Gyms are looked up through OpenStreetMap/Overpass
+a gym less than 13 minutes away on foot and rejects known TfL commutes over 30 minutes.
+Gyms are looked up through OpenStreetMap/Overpass
 and routed with Valhalla. `GrocerMetadataFetcher` also discovers nearby supermarkets,
 convenience stores and greengrocers, with pedestrian times saved under `type='grocer'`.
 Their validated JSON is saved once per property in `amenities`
@@ -67,8 +68,9 @@ in separate tables, nearest first, with their walking times.
 The groceries table has a collapsed expander with the shop count. Email clients that
 do not support native HTML expanders display the table expanded.
 
-Flats that pass the gym filter also get a TfL journey estimate to the search target,
-arriving by 9am on the next weekday. Emails show the shortest public transport journey
+The TfL journey estimate is fetched before the amenities filter, to the search target,
+arriving by 9am on the next weekday. Exactly 30 minutes passes the commute rule.
+Emails show the shortest public transport journey
 in minutes, including walking, with its planned arrival date. An unavailable estimate
 does not stop downloads or review.
 OpenRent's original search commute minutes are retained in

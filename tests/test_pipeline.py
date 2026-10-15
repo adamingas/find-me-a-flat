@@ -141,10 +141,14 @@ async def test_amenities_follow_cheap_filters_and_gate_images_and_review(pipelin
     from openrent import review
     from openrent.gyms import GymAmenities
 
-    properties = [property_fixture(index) for index in range(1, 4)]
+    properties = [property_fixture(index) for index in range(1, 5)]
     properties[0].bedrooms = 1
     fetched, reviewed, commutes = [], [], []
-    payloads = {2: gym_payload(780), 3: gym_payload(900, 284)}
+    payloads = {2: gym_payload(780), 3: gym_payload(900, 284), 4: gym_payload(284)}
+    commute_payloads = {
+        index: {"target": "Victoria", "duration_minutes": minutes}
+        for index, minutes in ((2, 20), (3, 30), (4, 31))
+    }
 
     class Fetcher:
         type = "gym"
@@ -155,9 +159,12 @@ async def test_amenities_follow_cheap_filters_and_gate_images_and_review(pipelin
 
         async def fetch(self, property):
             assert await database.get_property(pipeline.db, property.id) is not None
-            assert await database.query(pipeline.db, "SELECT count(*) AS n FROM image_blobs") == [
-                {"n": 0}
-            ]
+            assert await database.query(
+                pipeline.db,
+                "SELECT count(*) AS n FROM property_images "
+                "WHERE property_id = ? AND content_sha256 IS NOT NULL",
+                (property.id,),
+            ) == [{"n": 0}]
             fetched.append(property.id)
             return payloads[property.id]
 
@@ -175,6 +182,7 @@ async def test_amenities_follow_cheap_filters_and_gate_images_and_review(pipelin
         assert evidence.data["amenities"] == {
             "gym": payloads[evidence.property_id],
             "grocer": {"grocers": [{"name": "Supermarket", "walking_seconds": 300}]},
+            "commute": commute_payloads[evidence.property_id],
         }
         reviewed.append(evidence.property_id)
         return judgement()
@@ -182,6 +190,9 @@ async def test_amenities_follow_cheap_filters_and_gate_images_and_review(pipelin
     @DBOS.step()
     async def commute(property, target):
         commutes.append(property.id)
+        await database.store_amenity(
+            pipeline.db, property.id, "commute", json.dumps(commute_payloads[property.id])
+        )
 
     monkeypatch.setattr(ingestion, "fetch_commute", commute)
     monkeypatch.setattr(ingestion, "GymMetadataFetcher", Fetcher)
@@ -203,22 +214,24 @@ async def test_amenities_follow_cheap_filters_and_gate_images_and_review(pipelin
         )
         outcomes.append(await handle.get_result())
     await (await DBOS.retrieve_workflow_async("review:3")).get_result()
-    assert outcomes == ["filtered", "filtered", "downloaded"]
-    assert fetched == [2, 3]
-    assert grocers == [2, 3]
+    assert outcomes == ["filtered", "filtered", "downloaded", "filtered"]
+    assert fetched == [2, 3, 4]
+    assert grocers == [2, 3, 4]
     assert await database.get_property(pipeline.db, 1) is None
     assert await database.get_amenities(pipeline.db, 1) == {}
     assert await database.get_amenities(pipeline.db, 2) == {
         "gym": payloads[2],
         "grocer": {"grocers": [{"name": "Supermarket", "walking_seconds": 300}]},
+        "commute": commute_payloads[2],
     }
     assert reviewed == [3]
-    assert commutes == [3]
+    assert commutes == [2, 3, 4]
     assert len(pipeline.client.downloaded) == 2
     assert await database.query(
         pipeline.db, "SELECT property_id FROM property_images WHERE content_sha256 IS NOT NULL"
     ) == [{"property_id": 3}, {"property_id": 3}]
     assert await DBOS.get_workflow_status_async("review:2") is None
+    assert await DBOS.get_workflow_status_async("review:4") is None
 
 
 @pytest.mark.asyncio

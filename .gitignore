@@ -8,3 +8,4 @@ cookies.txt
 .env.*
 research/
 dist/
+*.log
