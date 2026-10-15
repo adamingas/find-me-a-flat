@@ -36,7 +36,9 @@ and downloading images. Rejected properties finish their DBOS workflow with a fi
 Properties that pass these checks are saved before amenity metadata is fetched. The property
 workflow always calls `post_amenities_filter(property_id)` from `filtering.py` next. This
 checkpointed function reads the saved JSON through SQLite and requires the shortest gym
-walk to be strictly below 13 minutes. Edit the function to change these rules; there is no
+walk to be strictly below 13 minutes and rejects a known TfL commute over 30 minutes.
+Exactly 30 minutes passes; a missing or unavailable TfL estimate does not reject a property.
+Edit the function to change these rules; there is no
 CLI setting. A rejection stops image downloads and review; the property and
 its amenity facts remain archived. Missing property coordinates or a failed/incomplete provider
 response raises a retryable error. A completed lookup with no gyms, or no reachable gym,
@@ -114,7 +116,7 @@ Endpoints can be changed through its constructor. Provider references:
 [Valhalla matrix API](https://valhalla.github.io/valhalla/api/matrix/), and
 [OSM fitness-centre tags](https://wiki.openstreetmap.org/wiki/Tag:leisure%3Dfitness_centre).
 
-After the gym filter passes, `CommuteMetadataFetcher` uses TfL's journey planner to route
+Before the amenities filter runs, `CommuteMetadataFetcher` uses TfL's journey planner to route
 from the listing coordinates to the search centre. It requests arrival by 09:00 London time
 on the next weekday after the lookup date (Monday through Friday, without bank-holiday
 adjustments). It saves the shortest returned public transport journey arriving by that time,
