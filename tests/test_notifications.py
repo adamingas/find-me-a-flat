@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 
 from openrent import db as database
 from openrent import notifications
+from openrent.settings import load_settings
 
 
 def notify_args(path, *recipients, **kwargs):
@@ -354,7 +355,7 @@ def test_invalid_preview_recipients_are_rejected(tmp_path, recipients, message):
 
 
 @pytest.mark.asyncio
-async def test_token_files_environment_override_and_retry_saved_digest(
+async def test_startup_token_survives_file_changes_and_retry_saved_digest(
     tmp_path, monkeypatch, mock_email_transport
 ):
     monkeypatch.chdir(tmp_path)
@@ -379,15 +380,20 @@ async def test_token_files_environment_override_and_retry_saved_digest(
     args = notify_args(path, recipient, env_file=token_file)
     assert await deliver(args) == 1
     assert headers == ["Bearer test-file-token"]
+    token_file.write_text("RESEND_TOKEN=ENC[encrypted-after-startup]\n")
     await add_listing(path, 1, title="Changed after judging", rent_pcm_pence=999900)
     await saved_review(path, 4)
     monkeypatch.setenv("RESEND_TOKEN", "test-environment-token")
     assert await deliver(args) == 0
     assert requests[1] == requests[0] and keys[1] == keys[0]
     assert keys[2] != keys[0] and requests[2]["subject"] == "1 new flats found"
-    assert headers[1:] == ["Bearer test-environment-token"] * 2
+    assert headers[1:] == ["Bearer test-file-token"] * 2
     assert await deliver(args) == 0 and len(requests) == 3
     await saved_review(path, 5)
+    load_settings.cache_clear()  # A new daemon uses the process override.
+    assert await deliver(args) == 0
+    assert headers[-1] == "Bearer test-environment-token"
+    await saved_review(path, 6)
     monkeypatch.delenv("RESEND_TOKEN")
     (tmp_path / ".env").write_text("RESEND_TOKEN=test-default-token\n")
     assert await deliver(notify_args(path, recipient)) == 0
@@ -398,4 +404,4 @@ async def test_token_files_environment_override_and_retry_saved_digest(
             for row in await database.fetch_all(
                 db, "SELECT status,attempts FROM email_batches ORDER BY id"
             )
-        ] == [("sent", 2), ("sent", 1), ("sent", 1)]
+        ] == [("sent", 2), ("sent", 1), ("sent", 1), ("sent", 1)]

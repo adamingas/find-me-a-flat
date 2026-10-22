@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+hooks_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+
+if [[ -n "${PRE_COMMIT_FROM_REF:-}" && -n "${PRE_COMMIT_TO_REF:-}" ]]; then
+  commits=$(git rev-list --reverse "$PRE_COMMIT_TO_REF" "^$PRE_COMMIT_FROM_REF")
+else
+  local_ref=${PRE_COMMIT_LOCAL_BRANCH:-HEAD}
+  remote_name=${PRE_COMMIT_REMOTE_NAME:-origin}
+  local_sha=$(git rev-parse "$local_ref")
+  commits=$(git rev-list --reverse "$local_sha" --not "--remotes=$remote_name")
+fi
+
+while IFS= read -r commit; do
+  [[ -n "$commit" ]] || continue
+  while IFS= read -r -d '' path; do
+    "$hooks_dir/check-env-file" "$commit:$path" "$path"
+  done < <(git diff-tree --root --no-commit-id --diff-filter=ACMRT --name-only -r -z "$commit")
+done <<< "$commits"

@@ -14,6 +14,14 @@ from openrent import db as database
 from openrent import ingestion
 from openrent.daemon import register_queues
 from openrent.runtime import Runtime, configure
+from openrent.settings import load_settings
+
+
+@pytest.fixture(autouse=True)
+def clear_settings():
+    load_settings.cache_clear()
+    yield
+    load_settings.cache_clear()
 
 
 @pytest.fixture(autouse=True)

@@ -13,7 +13,7 @@ dependencies = [
     "openai-agents>=0.23.1,<1",
     "pillow>=11,<13",
     "pydantic>=2.13,<3",
-    "python-dotenv>=1,<2",
+    "pydantic-settings>=2,<3",
     "tenacity>=9,<10",
     "tzdata>=2026.5",
 ]
@@ -31,6 +31,7 @@ packages = ["src/openrent"]
 [dependency-groups]
 dev = [
     "hypothesis>=6.168.5",
+    "pre-commit>=4,<5",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.13,<1",

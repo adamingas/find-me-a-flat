@@ -13,6 +13,7 @@ from openrent import db as database
 from openrent import review
 from openrent.ingestion import REVIEW_QUEUE
 from openrent.review import configuration, review_property
+from openrent.settings import load_settings
 
 
 def arguments(criteria, **overrides):
@@ -52,9 +53,7 @@ def test_invalid_review_settings_fail_before_starting_ai(tmp_path, monkeypatch, 
         configuration(arguments(criteria, **value))
 
 
-def test_review_config_does_not_checkpoint_credentials_and_resolves_them_at_execution(
-    tmp_path, monkeypatch
-):
+def test_review_config_keeps_startup_credentials_out_of_checkpoints(tmp_path, monkeypatch):
     criteria = tmp_path / "criteria.txt"
     criteria.write_text("Bright flats")
     env = tmp_path / "private.env"
@@ -63,7 +62,10 @@ def test_review_config_does_not_checkpoint_credentials_and_resolves_them_at_exec
     config = configuration(arguments(criteria))
     assert config.model_configuration().api_key == "private-file-token"
     assert "private-file-token" not in repr(asdict(config))
+    env.write_text("OPENAI_API_KEY=ENC[encrypted-after-startup]\n")
     monkeypatch.setenv("OPENAI_API_KEY", "private-environment-token")
+    assert config.model_configuration().api_key == "private-file-token"
+    load_settings.cache_clear()  # Simulate restarting with new process credentials.
     assert config.model_configuration().api_key == "private-environment-token"
     assert configuration(arguments(criteria)).profile_key == config.profile_key
     criteria.write_text("Different preferences")

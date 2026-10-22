@@ -11,11 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from dbos import DBOS
-from dotenv import dotenv_values
 
 from . import db as database
 from .judge import judge_property
-from .model_config import api_configuration
+from .model_config import OpenAIConfig, OpenRouterConfig
+from .settings import load_settings
 
 
 @dataclass(frozen=True)
@@ -32,8 +32,14 @@ class ReviewConfig:
     def model_configuration(self):
         if self.backend != "responses":
             return None
-        settings = dict(dotenv_values(self.env_file)) if self.env_file.is_file() else {}
-        return api_configuration(self.model, self.api, self.provider, settings)
+        settings = load_settings(self.env_file.resolve())
+        if self.api == "openrouter":
+            if not settings.openrouter_api_key.strip():
+                raise ValueError("Set OPENROUTER_API_KEY or OPENROUTER_TOKEN.")
+            return OpenRouterConfig(self.model, settings.openrouter_api_key, self.provider)
+        if not settings.openai_api_key.strip():
+            raise ValueError("Set OPENAI_API_KEY for native Agents SDK requests.")
+        return OpenAIConfig(self.model, settings.openai_api_key)
 
 
 def configuration(args) -> ReviewConfig:

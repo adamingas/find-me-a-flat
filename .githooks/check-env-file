@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+object=$1
+path=$2
+name=${path##*/}
+
+case "$name" in
+  .env|.env.*) ;;
+  *) exit 0 ;;
+esac
+
+if git show "$object" 2>/dev/null | awk '
+  /^sops_version=/ { version = 1 }
+  /^sops_mac=/ { mac = 1 }
+  /ENC\[AES256_GCM,/ { encrypted_value = 1 }
+  END { exit !(version && mac && encrypted_value) }
+'; then
+  exit 0
+fi
+
+printf 'Refusing to commit or push %s: it does not look like a SOPS-encrypted dotenv file.\n' "$path" >&2
+printf 'Encrypt it with SOPS before adding it to Git.\n' >&2
+exit 1

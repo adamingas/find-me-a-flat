@@ -1,4 +1,5 @@
 .venv/
+secrets/
 __pycache__/
 .ruff_cache/
 *.sqlite*

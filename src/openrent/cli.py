@@ -159,7 +159,7 @@ def env_file_flag(command):
     return click.option(
         "--env-file",
         type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
-        help="Read credentials from this file; uses .env if present.",
+        help="Load credentials once at startup; uses .env if present. Process variables override it.",
     )(command)
 
 

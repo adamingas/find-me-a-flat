@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -119,31 +118,3 @@ class OpenRouterConfig:
                 f"{self.model} through {selected} does not advertise strict structured output; "
                 "choose a provider supporting response_format and structured_outputs."
             )
-
-
-def api_configuration(model: str, api: str, provider: str | None, settings: dict) -> ModelConfig:
-    """Resolve credentials without changing the process environment or revealing tokens."""
-    environment = dict(os.environ)
-    if api not in {"openai", "openrouter"}:
-        raise ValueError(f"Unknown model API: {api}")
-    if api == "openrouter":
-        token = next(
-            (
-                source.get(name)
-                for source in (environment, settings)
-                for name in ("OPENROUTER_API_KEY", "OPENROUTER_TOKEN")
-                if source.get(name)
-            ),
-            "",
-        )
-        if not token.strip():
-            raise ValueError(
-                "Set OPENROUTER_API_KEY or OPENROUTER_TOKEN in the environment or env file."
-            )
-        return OpenRouterConfig(model, token, provider)
-    if provider is not None:
-        raise ValueError("--review-provider requires --review-api openrouter.")
-    token = environment.get("OPENAI_API_KEY", settings.get("OPENAI_API_KEY", ""))
-    if not token or not token.strip():
-        raise ValueError("Set OPENAI_API_KEY for native Agents SDK requests.")
-    return OpenAIConfig(model, token)

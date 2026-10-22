@@ -11,6 +11,18 @@ provides SQLite JSONB support. For the Codex backend, install the Codex CLI and 
 with `codex login --device-auth`. Model API configuration is described in
 [docs/reviews.md](docs/reviews.md).
 
+Enable the repository's pre-commit hooks once in each checkout:
+
+```sh
+pre-commit install
+```
+
+The hooks reject staged or pushed `.env` and `.env.*` files unless their contents include
+SOPS dotenv metadata and encrypted values. The check covers outgoing commit history so a
+plaintext env file cannot be hidden by encrypting it in a later commit. Local Git hooks can
+be bypassed, so use a server-side push rule as well if this must be enforced for every
+contributor. See [.pre-commit-config.yaml](.pre-commit-config.yaml) for the hook definitions.
+
 Start the local map services before the daemon:
 
 ```sh
@@ -80,8 +92,8 @@ even when the TfL lookup is unavailable.
 Review checkpoints the AI result before saving it with the archived evidence. A restart
 recovers unfinished work using DBOS, including a property interrupted after its last image
 but before review was queued. Completed properties and reviews are not repeated on later
-discovery. Workflow inputs retain the original filters and criteria; credentials are resolved
-from the environment or env file when a step executes.
+discovery. Workflow inputs retain the original filters and criteria. Pydantic Settings loads
+credentials once at startup, with process variables overriding the env file; restart to reload.
 
 All OpenRent requests share one HTTP client, concurrency bound and rate limiter, including
 redirects and retries. Review agents have their own concurrency limit. Omit
@@ -111,7 +123,64 @@ state. Preserve both databases, including their WAL files when copying a running
 
 The application uses one schema and storage layer for properties, reviews and notification.
 
-Edit [deploy/openrent.service](deploy/openrent.service) with your paths and model, then:
+For a Linux system service that starts after reboot and decrypts `.env` using an Age key,
+install `uv` and `sops` system-wide (in `/usr/local/bin` or `/usr/bin`) on a server with
+systemd 250+ and `systemd-creds`. From wherever you cloned the repository, run:
+
+```sh
+./deploy/setup-systemd.sh
+```
+
+The installer requests sudo automatically, then prompts for the single `AGE-SECRET-KEY-1…`
+line with terminal echo disabled. Paste only that line and press Enter. It passes the key
+directly to `systemd-creds` through a pipe, without putting it in command arguments, exported
+environment variables, or a plaintext key file. Shell tracing and core dumps are disabled.
+The key is briefly held in process memory; clear your clipboard after pasting.
+
+`.env` must already be SOPS-encrypted in dotenv
+format; setup checks that it decrypts without printing its contents. Review `schedule.sh`
+before installing: setup starts it immediately, including its `--run-now` work and scheduled
+emails. This setup uses a native Age identity, not an SSH private key.
+
+The installer creates a locked `openrent` account with a `nologin` shell and no extra groups.
+It copies the application and encrypted `.env` into `/opt/openrent`, sets their permissions,
+and encrypts the Age key into `/etc/openrent/age-key.cred`
+(root-owned, mode `0600`). `uv run` manages dependencies at service startup, using the
+committed lockfile, with its virtual environment, Python downloads, and cache under
+`/var/lib/openrent`. Setup uses the system-installed `uv` and `sops`.
+The unit uses `LoadCredentialEncrypted=age-key:...` and sets
+`SOPS_AGE_KEY_FILE=%d/age-key`, pointing SOPS at the read-only runtime credential.
+Setup verifies decryption through a temporary systemd service before installing the credential.
+The service can write to `/var/lib/openrent` and `/opt/openrent/data`; systemd makes the rest
+of its filesystem read-only. SOPS supplies the decrypted
+variables to `schedule.sh` without saving a plaintext environment file. The service account
+and root can still read the Age key while it is supplied to the running service.
+
+Encryption uses `systemd-creds --with-key=auto`: TPM2 and/or the host key as available.
+Without TPM protection, copying both the encrypted credential and the host key at
+`/var/lib/systemd/credential.secret` allows offline decryption. Keep a secure backup of
+your original Age identity for recovery on another server.
+
+`openrent.service` starts at boot and retries after exits every 30 seconds. An explicit
+`systemctl stop` keeps it stopped until it is started again or the server reboots.
+
+```sh
+sudo systemctl status openrent.service
+sudo journalctl -u openrent.service -f
+sudo systemctl restart openrent.service
+sudo systemctl stop openrent.service
+```
+
+Rerun setup after updating the checkout, encrypted `.env`, key, or unit configuration;
+uv applies lockfile changes on startup. Installed databases under `/opt/openrent/data`
+are preserved. Databases in the source checkout are not automatically migrated.
+Stop any previous user service or manually started daemon to avoid duplicate work and emails.
+If you used an older installer that copied a plaintext key to `/etc/openrent/age-keys.txt`,
+remove that unused copy after confirming the credential-based service works.
+The installer does not start the local map containers described above.
+
+Alternatively, for the original user service with a plaintext environment file,
+edit [deploy/openrent.service](deploy/openrent.service) with your paths and model, then:
 
 ```sh
 mkdir -p ~/.config/systemd/user

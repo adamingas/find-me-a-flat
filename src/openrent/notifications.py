@@ -12,7 +12,6 @@ from pathlib import Path
 
 import aiosqlite
 from dbos import DBOS
-from dotenv import dotenv_values
 
 from . import db as database
 from .email_digest import DigestListing, render_digest
@@ -23,6 +22,7 @@ from .email_sender import (
     ResendEmailSender,
     validate_recipient,
 )
+from .settings import load_settings
 
 
 @dataclass(frozen=True)
@@ -81,12 +81,8 @@ def configuration(args) -> NotificationConfig | None:
         if preview.resolve() == env_file.resolve():
             raise ValueError("Email preview must not overwrite the environment file.")
         return NotificationConfig(recipients, preview=preview)
-    if env_file.exists() and not env_file.is_file():
-        raise ValueError("The environment file must be a regular file.")
-    settings = dict(dotenv_values(env_file)) if env_file.is_file() else {}
-    settings.update(os.environ)
     timeout = getattr(args, "email_timeout", 30)
-    token = settings.get("RESEND_TOKEN") or ""
+    token = load_settings(env_file.resolve()).resend_token
     if not token:
         raise ValueError("Email sending needs RESEND_TOKEN in the environment or env file.")
     return NotificationConfig(recipients, provider=ResendEmailConfig(token, timeout=timeout))
@@ -283,17 +279,13 @@ class NotificationSettings:
     email_timeout: float
     env_file: Path
 
-    def configuration(self):
-        # Credentials are resolved when the step executes, never saved in DBOS.
-        return configuration(self)
-
 
 @DBOS.step()
 async def deliver_digest(settings: NotificationSettings) -> int:
     from .runtime import resources
 
     runtime = resources()
-    config = settings.configuration()
+    config = configuration(settings)
     if config is None:
         return 0
     return await send_pending(runtime.db, config, runtime.report)

@@ -1,0 +1,38 @@
+[Unit]
+Description=OpenRent scheduled discovery and notifications (SOPS)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=openrent
+Group=openrent
+WorkingDirectory=/opt/openrent
+Environment=HOME=/var/lib/openrent
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+LoadCredentialEncrypted=age-key:/etc/openrent/age-key.cred
+Environment=SOPS_AGE_KEY_FILE=%d/age-key
+Environment=UV_PROJECT_ENVIRONMENT=/var/lib/openrent/venv
+Environment=UV_FROZEN=true
+Environment=UV_NO_DEV=true
+Environment=UV_PYTHON_INSTALL_DIR=/var/lib/openrent/python
+Environment=UV_CACHE_DIR=/var/lib/openrent/cache
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/env sops exec-env .env "/bin/bash ./schedule.sh"
+Restart=always
+RestartSec=30
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/openrent /opt/openrent/data
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

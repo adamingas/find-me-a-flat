@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+hooks_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+
+while IFS= read -r -d '' path; do
+  "$hooks_dir/check-env-file" ":$path" "$path"
+done < <(git diff --cached --name-only --diff-filter=ACMRT -z)
