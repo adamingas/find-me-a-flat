@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-uv run openrent daemon \
+exec uv run openrent daemon \
   --cron '0 */2 * * *' \
   --notify-cron-schedule '0 10 * * *' \
   --timezone Europe/London \
@@ -16,6 +16,9 @@ uv run openrent daemon \
   --requests-per-minute 60 \
   --db data/flats.sqlite \
   --criteria-file criteria.txt \
-  --review-model gpt-6-luna \
+  --review-model openai/gpt-6-luna \
+  --review-api openrouter \
+  --review-backend responses \
   --email-to adamingas@gmail.com \
-  --email-to sofia.birattari@gmail.com
+  --email-to sofia.birattari@gmail.com \
+  "$@"
