@@ -123,71 +123,49 @@ state. Preserve both databases, including their WAL files when copying a running
 
 The application uses one schema and storage layer for properties, reviews and notification.
 
-For a Linux system service that starts after reboot and decrypts `.env` using an Age key,
-install `uv` and `sops` system-wide (in `/usr/local/bin` or `/usr/bin`) on a server with
-systemd 250+ and `systemd-creds`. From wherever you cloned the repository, run:
+### Docker Compose (Linux)
+
+The `openrent` container runs the unchanged `schedule.sh`: discovery, reviews and
+scheduled email notifications run together. Overpass and Valhalla remain separate
+Compose services. Host networking preserves the application's existing localhost map URLs.
+
+Export `OPENROUTER_API_KEY` (or `OPENROUTER_TOKEN`) and `RESEND_TOKEN` in your shell,
+then build and start everything:
 
 ```sh
-./deploy/setup-systemd.sh
+docker compose --env-file /dev/null up -d --build
+docker compose --env-file /dev/null logs -f openrent
 ```
 
-The installer requests sudo automatically, then prompts for the single `AGE-SECRET-KEY-1…`
-line with terminal echo disabled. Paste only that line and press Enter. It passes the key
-directly to `systemd-creds` through a pipe, without putting it in command arguments, exported
-environment variables, or a plaintext key file. Shell tracing and core dumps are disabled.
-The key is briefly held in process memory; clear your clipboard after pasting.
+The explicit empty env file prevents Compose from loading the repository's encrypted
+`.env`. Secrets come from your shell and are never copied into the image. Dependencies
+are installed with uv during the build.
 
-`.env` must already be SOPS-encrypted in dotenv
-format; setup checks that it decrypts without printing its contents. Review `schedule.sh`
-before installing: setup starts it immediately, including its `--run-now` work and scheduled
-emails. This setup uses a native Age identity, not an SSH private key.
+The `openrent-data` volume preserves the application and DBOS databases across container
+replacements. Existing host databases are not automatically migrated. Containers restart
+after a server reboot when Docker starts; ensure Docker is enabled at boot.
+Stop any existing systemd service or manually running daemon before starting Compose
+to avoid duplicate work. Startup runs the schedule's existing `--run-now` option.
+Compose starts the map containers without waiting for their initial data imports;
+map requests may fail until they are ready.
 
-The installer creates a locked `openrent` account with a `nologin` shell and no extra groups.
-It copies the application and encrypted `.env` into `/opt/openrent`, sets their permissions,
-and encrypts the Age key into `/etc/openrent/age-key.cred`
-(root-owned, mode `0600`). `uv run` manages dependencies at service startup, using the
-committed lockfile, with its virtual environment, Python downloads, and cache under
-`/var/lib/openrent`. Setup uses the system-installed `uv` and `sops`.
-The unit uses `LoadCredentialEncrypted=age-key:...` and sets
-`SOPS_AGE_KEY_FILE=%d/age-key`, pointing SOPS at the read-only runtime credential.
-Setup verifies decryption through a temporary systemd service before installing the credential.
-The service can write to `/var/lib/openrent` and `/opt/openrent/data`; systemd makes the rest
-of its filesystem read-only. SOPS supplies the decrypted
-variables to `schedule.sh` without saving a plaintext environment file. The service account
-and root can still read the Age key while it is supplied to the running service.
+### Publish and pull
 
-Encryption uses `systemd-creds --with-key=auto`: TPM2 and/or the host key as available.
-Without TPM protection, copying both the encrypted credential and the host key at
-`/var/lib/systemd/credential.secret` allows offline decryption. Keep a secure backup of
-your original Age identity for recovery on another server.
+Push these files to GitHub, then run the **Publish container** workflow from Actions.
+It builds Linux amd64 and arm64 images and pushes them to
+`ghcr.io/adamingas/find-me-a-flat:latest`, plus a tag for the commit.
+For a private package, authenticate the server to GHCR with an account/token that
+has permission to read it.
 
-`openrent.service` starts at boot and retries after exits every 30 seconds. An explicit
-`systemctl stop` keeps it stopped until it is started again or the server reboots.
+After publishing, the server only needs `compose.yaml` and the exported environment
+variables:
 
 ```sh
-sudo systemctl status openrent.service
-sudo journalctl -u openrent.service -f
-sudo systemctl restart openrent.service
-sudo systemctl stop openrent.service
+docker compose --env-file /dev/null pull
+docker compose --env-file /dev/null up -d --no-build
 ```
 
-Rerun setup after updating the checkout, encrypted `.env`, key, or unit configuration;
-uv applies lockfile changes on startup. Installed databases under `/opt/openrent/data`
-are preserved. Databases in the source checkout are not automatically migrated.
-Stop any previous user service or manually started daemon to avoid duplicate work and emails.
-If you used an older installer that copied a plaintext key to `/etc/openrent/age-keys.txt`,
-remove that unused copy after confirming the credential-based service works.
-The installer does not start the local map containers described above.
-
-Alternatively, for the original user service with a plaintext environment file,
-edit [deploy/openrent.service](deploy/openrent.service) with your paths and model, then:
-
-```sh
-mkdir -p ~/.config/systemd/user
-cp deploy/openrent.service ~/.config/systemd/user/openrent.service
-systemctl --user daemon-reload
-systemctl --user enable --now openrent.service
-journalctl --user -u openrent.service -f
-```
+Pulling alone downloads the image; `up` recreates the container with the new image.
+Schedule and criteria changes require rebuilding the image.
 
 To verify the pipeline offline, run `uv run pytest` and `uv run ruff check src tests`.

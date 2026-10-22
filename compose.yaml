@@ -1,6 +1,28 @@
 name: openrent
 
 services:
+  openrent:
+    image: ghcr.io/adamingas/find-me-a-flat:latest
+    build: .
+    restart: unless-stopped
+    init: true
+    # The existing app connects to the map services on host loopback (Linux).
+    network_mode: host
+    depends_on:
+      - overpass
+      - valhalla
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-${OPENROUTER_TOKEN:-}}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      RESEND_TOKEN: ${RESEND_TOKEN:?Set RESEND_TOKEN in your environment}
+    volumes:
+      - openrent-data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   overpass:
     image: wiktorn/overpass-api@sha256:5f643f2aa500333f19458fe8be14457215d6e0b9f891ca5c5ed452b1f8882c47
     restart: always
@@ -25,7 +47,7 @@ services:
       OVERPASS_STOP_AFTER_INIT: "false"
       OVERPASS_USE_AREAS: "false"
       OVERPASS_ALLOW_DUPLICATE_QUERIES: "yes"
-    cpus: 4
+    cpus: 1
     mem_limit: 6g
     healthcheck:
       test: ["CMD", "/app/docker-healthcheck.sh"]
@@ -51,7 +73,7 @@ services:
       server_threads: "2"
       build_elevation: "False"
       build_transit: "False"
-    cpus: 2
+    cpus: 1
     mem_limit: 4g
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8002/status"]
@@ -66,5 +88,6 @@ services:
         max-file: "3"
 
 volumes:
+  openrent-data:
   overpass-data:
   valhalla-data:
