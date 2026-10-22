@@ -18,10 +18,10 @@ from openrent.grocers import GrocerMetadataFetcher
 
 @asynccontextmanager
 async def provider(handler):
-    client = AmenityClient(overpass_fallback_url=None)
+    client = AmenityClient(overpass_fallback_url=None, valhalla_fallback_url=None)
     await client.http.aclose()
     client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    client._intervals = {"overpass": 0, "valhalla": 0, "tfl": 0}
+    client._intervals = dict.fromkeys(client._intervals, 0)
     async with client:
         yield client
 
@@ -73,7 +73,7 @@ async def test_grocery_types_centres_duplicates_and_unreachable_routes():
                 assert f'nwr(around:1500,51.440875,-0.154623)["shop"="{kind}"];' in query
             assert "out center tags" in query
             return httpx.Response(200, json={"elements": elements})
-        assert str(request.url) == "http://127.0.0.1:8002/sources_to_targets"
+        assert str(request.url) == "https://valhalla1.openstreetmap.de/sources_to_targets"
         routing = json.loads(request.content)
         assert routing["costing"] == "pedestrian"
         assert routing["costing_options"] == {"pedestrian": {"walking_speed": 5}}

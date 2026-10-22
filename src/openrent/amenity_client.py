@@ -12,7 +12,8 @@ from .client import FetchError
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 OVERPASS_FALLBACK_URL = "http://127.0.0.1:8003/api/interpreter"
-VALHALLA_URL = "http://127.0.0.1:8002/sources_to_targets"
+VALHALLA_URL = "https://valhalla1.openstreetmap.de/sources_to_targets"
+VALHALLA_FALLBACK_URL = "http://127.0.0.1:8002/sources_to_targets"
 TFL_URL = "https://api.tfl.gov.uk"
 WALKING_SPEED_KMH = 5.0
 
@@ -50,22 +51,31 @@ class AmenityClient:
         overpass_url: str = OVERPASS_URL,
         overpass_fallback_url: str | None = OVERPASS_FALLBACK_URL,
         valhalla_url: str = VALHALLA_URL,
+        valhalla_fallback_url: str | None = VALHALLA_FALLBACK_URL,
         tfl_url: str = TFL_URL,
     ):
         self.overpass_url = overpass_url
         self.overpass_fallback_url = overpass_fallback_url
-        self._overpass_retry_at = 0.0
+        self._public_retry_at = {"overpass": 0.0, "valhalla": 0.0}
         self.valhalla_url = valhalla_url
+        self.valhalla_fallback_url = valhalla_fallback_url
         self.tfl_url = tfl_url
         self.http = httpx.AsyncClient(
             timeout=timeout,
             headers={"User-Agent": "openrent-fetch/0.1 (personal rental search)"},
         )
         self._locks = {
-            name: asyncio.Lock() for name in ("overpass", "overpass_local", "valhalla", "tfl")
+            name: asyncio.Lock()
+            for name in ("overpass", "overpass_local", "valhalla", "valhalla_local", "tfl")
         }
         self._next_request = {name: 0.0 for name in self._locks}
-        self._intervals = {"overpass": 10.0, "overpass_local": 0.0, "valhalla": 1.0, "tfl": 1.5}
+        self._intervals = {
+            "overpass": 10.0,
+            "overpass_local": 0.0,
+            "valhalla": 1.0,
+            "valhalla_local": 1.0,
+            "tfl": 1.5,
+        }
 
     async def __aenter__(self):
         await self.http.__aenter__()
@@ -116,12 +126,12 @@ class AmenityClient:
 
     async def request(self, service: str, *, path: str = "", **kwargs) -> dict:
         async with self._locks[service]:
-            if (
-                service == "overpass"
-                and self.overpass_fallback_url
-                and time.monotonic() < self._overpass_retry_at
-            ):
-                return await self.request("overpass_local", path=path, **kwargs)
+            fallback_url = {
+                "overpass": self.overpass_fallback_url,
+                "valhalla": self.valhalla_fallback_url,
+            }.get(service)
+            if fallback_url and time.monotonic() < self._public_retry_at[service]:
+                return await self.request(f"{service}_local", path=path, **kwargs)
             wait = self._next_request[service] - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
@@ -130,6 +140,7 @@ class AmenityClient:
                 "overpass": self.overpass_url,
                 "overpass_local": self.overpass_fallback_url,
                 "valhalla": self.valhalla_url,
+                "valhalla_local": self.valhalla_fallback_url,
                 "tfl": self.tfl_url,
             }[service]
             if path:
@@ -158,11 +169,11 @@ class AmenityClient:
                     isinstance(exc, httpx.HTTPStatusError)
                     and (exc.response.status_code == 429 or 500 <= exc.response.status_code < 600)
                 )
-                if service == "overpass" and self.overpass_fallback_url and retryable:
-                    self._overpass_retry_at = max(
-                        self._next_request["overpass"], time.monotonic() + 30
+                if fallback_url and retryable:
+                    self._public_retry_at[service] = max(
+                        self._next_request[service], time.monotonic() + 30
                     )
-                    return await self.request("overpass_local", path=path, **kwargs)
+                    return await self.request(f"{service}_local", path=path, **kwargs)
                 raise FetchError(f"{service} amenity lookup failed: {exc}") from exc
             except ValueError as exc:
                 raise FetchError(f"{service} amenity lookup failed: {exc}") from exc

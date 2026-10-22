@@ -79,18 +79,20 @@ It queries `shop=supermarket`, `convenience`, `greengrocer`, `grocery` and `food
 matrix routing as gyms and retains unreachable shops with null times. All candidates are
 stored; grocers do not add a rejection rule to `post_amenities_filter`.
 
-Valhalla runs locally through `compose.yaml`. Start it with `docker compose up -d valhalla`
-and wait for `docker compose ps` to report healthy before starting the app. The service
+Valhalla uses `https://valhalla1.openstreetmap.de/sources_to_targets` by default, with a
+local fallback through `compose.yaml`. Start it with `docker compose up -d valhalla`
+and wait for `docker compose ps` to report healthy before relying on the fallback. The service
 downloads the Greater London extract and builds its routing graph on the first start.
 The named `valhalla-data` volume retains the graph, and `restart: always` restarts the
-container after exits and Docker restarts. The default matrix endpoint is
+container after exits and Docker restarts. The local matrix endpoint is
 `http://127.0.0.1:8002/sources_to_targets`; the port is bound only to localhost.
 The image is pinned by digest, with two CPU cores, a 4 GiB memory limit and rotated logs.
 Its graph covers Greater London. To rebuild with newer map data, replace the cached PBF
 and rebuild the tiles; normal app and container restarts reuse the existing graph.
 
-Public Overpass request starts are spaced at least ten seconds apart and Valhalla starts
-at least one second apart, with one in-flight request per service and `Retry-After` honoured.
+Public Overpass request starts are spaced at least ten seconds apart. Public and local
+Valhalla request starts are each spaced at least one second apart, with one in-flight
+request per service and `Retry-After` honoured.
 These budgets are shared by all property workers and separate from OpenRent's budget.
 
 The local Overpass service in `compose.yaml` imports the Greater London extract into the
@@ -110,6 +112,14 @@ trying the public endpoint again. Local queries are serialized without the publi
 ten-second spacing. Successful empty results are accepted; other HTTP 4xx do not trigger
 fallback. If local Overpass fails too, the error reaches the existing DBOS step retry.
 Set `overpass_fallback_url=None` on `AmenityClient` to disable fallback explicitly.
+
+Valhalla follows the same public-to-local fallback on HTTP 429, any HTTP 5xx, timeout or
+connection error. Further lookups use local Valhalla during a public cooldown of at least
+30 seconds, extended by `Retry-After` when applicable, before trying the public endpoint
+again. Other HTTP 4xx do not trigger fallback. If local Valhalla fails too, the error reaches
+the existing DBOS step retry. Set `valhalla_fallback_url=None` on `AmenityClient` to disable
+Valhalla fallback explicitly.
+
 Endpoints can be changed through its constructor. Provider references:
 [Overpass Docker image](https://github.com/wiktorn/Overpass-API),
 [Overpass usage policy](https://dev.overpass-api.de/overpass-doc/en/preface/commons.html),

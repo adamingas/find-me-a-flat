@@ -23,7 +23,7 @@ plaintext env file cannot be hidden by encrypting it in a later commit. Local Gi
 be bypassed, so use a server-side push rule as well if this must be enforced for every
 contributor. See [.pre-commit-config.yaml](.pre-commit-config.yaml) for the hook definitions.
 
-Start the local map services before the daemon:
+Start the local map services to provide fallback for public requests:
 
 ```sh
 docker compose up -d overpass valhalla
@@ -31,7 +31,8 @@ docker compose logs -f overpass valhalla
 ```
 
 The first start imports Greater London's OpenStreetMap data into Overpass and builds
-Valhalla routing tiles. Wait for `docker compose ps` to show both services as healthy.
+Valhalla routing tiles. Local fallback is available once `docker compose ps` shows the
+services as healthy.
 Named volumes retain their data, and `restart: always` starts the containers again when
 Docker restarts. The app resends failed public Overpass requests to
 `http://127.0.0.1:8003/api/interpreter` on HTTP 429, any 5xx, timeouts or connection errors.
@@ -41,8 +42,12 @@ The Overpass image's built-in updater applies regional changes daily. To update 
 docker compose exec --user overpass overpass /app/bin/update_overpass.sh
 ```
 
-Valhalla uses `http://127.0.0.1:8002/sources_to_targets`. Both ports are exposed only on
-this machine. Check Valhalla's status with
+Valhalla uses `https://valhalla1.openstreetmap.de/sources_to_targets` first and falls back to
+`http://127.0.0.1:8002/sources_to_targets` on HTTP 429, any 5xx, timeouts or connection errors.
+Further requests use the local service for at least 30 seconds, extended by `Retry-After`,
+before trying the public endpoint again. Both public and local Valhalla requests are spaced
+at least one second apart. Both local ports are exposed only on this machine. Check
+Valhalla's status with
 `curl --fail http://127.0.0.1:8002/status`.
 
 ## Run
