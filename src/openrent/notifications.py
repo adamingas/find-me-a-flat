@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ from .email_sender import (
     validate_recipient,
 )
 from .settings import load_settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -91,12 +94,16 @@ def configuration(args) -> NotificationConfig | None:
 async def send_pending(
     db: aiosqlite.Connection,
     config: NotificationConfig,
-    report=print,
+    report=logger.info,
     *,
     additional_info_generator: Callable[[int], Awaitable[str]] | None = None,
 ) -> int:
     """The notification queue serializes delivery; review continues independently."""
 
+    report(
+        f"Email digest started: recipients={len(config.recipients)} "
+        f"mode={'preview' if config.preview is not None else 'send'}."
+    )
     if additional_info_generator is None:
         additional_info_generator = AmenityAdditionalInfoGenerator(db)
 
@@ -134,17 +141,20 @@ async def send_pending(
         while True:
             batch = await database.pending_email_batch(db, recipient)
             if batch is not None and batch["status"] == "unknown":
-                report(
-                    f"Email acceptance is unknown for {recipient}, batch {batch['id']}; "
-                    "check the email provider's logs before retrying."
+                logger.error(
+                    "Email acceptance is unknown for %s, batch %s; check the email provider's logs before retrying.",
+                    recipient,
+                    batch["id"],
                 )
                 failures += 1
                 break
             if batch is None:
                 records = await database.pending_notifications(db, recipient)
+                report(f"Email pending for {recipient}: {len(records)} eligible listings.")
                 if not records:
                     report(f"No new passed or uncertain flats to email to {recipient}.")
                     break
+                report(f"Preparing digest for {recipient}: {len(records)} listings.")
                 digest = render_digest(await listings(records))
                 batch = await database.create_email_batch(
                     db,
@@ -157,6 +167,7 @@ async def send_pending(
             if not await database.mark_email_sending(db, batch["id"]):
                 raise ValueError("Email batch could not be claimed for sending.")
             try:
+                report(f"Sending email batch={batch['id']} to {recipient}.")
                 receipt = await sender.send(
                     recipient,
                     batch["subject"],
@@ -171,15 +182,16 @@ async def send_pending(
                     "Sending interrupted; acceptance is unknown.",
                     indeterminate=True,
                 )
+                logger.warning("Email batch=%s interrupted; acceptance is unknown.", batch["id"])
                 raise
             except EmailSendIndeterminate as exc:
                 await database.fail_email_batch(db, batch["id"], str(exc), indeterminate=True)
-                report(f"Email acceptance unknown for {recipient}: {exc}")
+                logger.error("Email acceptance unknown for %s: %s", recipient, exc)
                 failures += 1
                 break
             except (EmailSendError, ValueError) as exc:
                 await database.fail_email_batch(db, batch["id"], str(exc))
-                report(f"Email to {recipient} failed: {exc}")
+                logger.error("Email to %s failed: %s", recipient, exc)
                 failures += 1
                 break
             if not receipt.accepted:
@@ -188,13 +200,17 @@ async def send_pending(
                     batch["id"],
                     "Resend reported the recipient bounced or was suppressed.",
                 )
-                report(f"Resend did not accept the email for {recipient}.")
+                logger.error("Resend did not accept the email for %s.", recipient)
                 failures += 1
                 break
             await database.finish_email_batch(db, batch["id"], receipt.provider_message_id)
-            report(f"Resend accepted email to {recipient}: {batch['subject']}.")
+            report(
+                f"Resend accepted email to {recipient}: batch={batch['id']} "
+                f"provider_message_id={receipt.provider_message_id}."
+            )
             # A saved retry can predate additional eligible reviews. Send those
             # in a fresh batch after this one has been recorded successfully.
+    report(f"Email digest finished: failed_recipients={failures}.")
     return int(bool(failures))
 
 
@@ -287,10 +303,13 @@ async def deliver_digest(settings: NotificationSettings) -> int:
     runtime = resources()
     config = configuration(settings)
     if config is None:
+        logger.info("Email digest skipped; no notification configuration.")
         return 0
-    return await send_pending(runtime.db, config, runtime.report)
+    return await send_pending(runtime.db, config, logger.info)
 
 
 @DBOS.workflow()
 async def notify(scheduled_time, settings: NotificationSettings) -> None:
-    await deliver_digest(settings)
+    logger.info("Scheduled email started: scheduled_time=%s.", scheduled_time)
+    result = await deliver_digest(settings)
+    logger.info("Scheduled email finished: reported_failures=%s.", bool(result))

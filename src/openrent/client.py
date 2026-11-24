@@ -13,7 +13,9 @@ from urllib.parse import urlparse
 
 import httpx
 from PIL import Image as PILImage
-from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt
+from tenacity import retry, retry_if_exception, stop_after_attempt
+
+from .http_logging import log_http_failure, safe_url
 
 BASE_URL = "https://www.openrent.co.uk"
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
@@ -44,18 +46,33 @@ def retry_request(operation):
     @wraps(operation)
     async def attempt(self, url, *args, **kwargs):
         async with self._slots:
-            return await operation(self, url, *args, **kwargs)
+            try:
+                return await operation(self, url, *args, **kwargs)
+            except httpx.HTTPStatusError as exc:
+                log_http_failure(exc.response, "http_status_error")
+                raise
+
+    def log_retry(state):
+        logging.getLogger(__name__).warning(
+            "Request retry: url=%s failed_attempt=%s delay_seconds=%s error=%s",
+            safe_url(state.args[1]),
+            state.attempt_number,
+            state.next_action.sleep,
+            type(state.outcome.exception()).__name__,
+        )
 
     retrying = retry(
         retry=retry_if_exception(
-            lambda exc: isinstance(exc, httpx.TransportError)
-            or isinstance(exc, httpx.HTTPStatusError)
-            and (exc.response.status_code == 429 or exc.response.status_code >= 500)
+            lambda exc: (
+                isinstance(exc, httpx.TransportError)
+                or isinstance(exc, httpx.HTTPStatusError)
+                and (exc.response.status_code == 429 or exc.response.status_code >= 500)
+            )
         ),
         stop=stop_after_attempt(6),
         wait=retry_wait,
         sleep=lambda seconds: asyncio.sleep(seconds),
-        before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
+        before_sleep=log_retry,
         reraise=True,
     )(attempt)
 
@@ -65,10 +82,10 @@ def retry_request(operation):
             return await retrying(self, url, *args, **kwargs)
         except httpx.HTTPError as exc:
             response = getattr(exc, "response", None)
-            detail = ""
-            if response is not None and response.status_code == 405 and response.is_stream_consumed:
-                detail = f"\n405 response (Allow: {response.headers.get('Allow', 'missing')}): {response.text[:2000]}"
-            raise FetchError(f"Could not fetch {url}: {exc}{detail}") from exc
+            status = response.status_code if response is not None else "no response"
+            raise FetchError(
+                f"Could not fetch {safe_url(url)}: {type(exc).__name__}; status={status}"
+            ) from None
 
     return wrapped
 
@@ -133,11 +150,12 @@ class OpenRentClient:
         if parsed.scheme != "https" or not (
             host == "openrent.co.uk" or host.endswith(".openrent.co.uk")
         ):
-            raise FetchError(f"Refusing a non-OpenRent HTTPS source URL: {url}")
+            raise FetchError(f"Refusing a non-OpenRent HTTPS source URL: {safe_url(url)}")
 
     @staticmethod
     def _check_access(response):
         if response.status_code in (403, 401):
+            log_http_failure(response, "access_refused")
             raise FetchError(
                 f"OpenRent refused access ({response.status_code}). "
                 "If needed, supply your own exported session with --cookie-file."
@@ -171,10 +189,12 @@ class OpenRentClient:
         try:
             summaries = response.json()
         except ValueError as exc:
+            log_http_failure(response, "invalid_summary_json")
             raise FetchError("OpenRent summary endpoint returned invalid JSON.") from exc
         if not isinstance(summaries, list) or not all(
             isinstance(item, dict) and "id" in item for item in summaries
         ):
+            log_http_failure(response, "invalid_summary_format")
             raise FetchError("OpenRent summary endpoint changed its response format.")
         return summaries
 
@@ -186,7 +206,7 @@ class OpenRentClient:
                 mime = PILImage.MIME.get(picture.format, "application/octet-stream")
                 picture.verify()
         except (OSError, ValueError, PILImage.DecompressionBombError) as exc:
-            raise FetchError(f"Source returned an invalid image: {url}") from exc
+            raise FetchError(f"Source returned an invalid image: {safe_url(url)}") from exc
         return mime, dimensions
 
     @retry_request

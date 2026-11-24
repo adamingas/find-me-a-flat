@@ -1,6 +1,7 @@
 """Own shared resources and configure independent DBOS discovery/digest schedules."""
 
 import asyncio
+import logging
 import signal
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,10 +22,13 @@ from .ingestion import (
     discover,
 )
 from .locking import ScanLock
+from .logging_setup import configure_logging
 from .notifications import NotificationSettings, notify
 from .notifications import configuration as notification_configuration
 from .review import configuration as review_configuration
 from .runtime import Runtime, configure
+
+logger = logging.getLogger(__name__)
 
 
 def system_path_for(database):
@@ -67,6 +71,7 @@ def schedule_inputs(args, discovery, notification):
 
 
 async def run_daemon(args, api, website):
+    configure_logging(quiet=args.quiet)
     ZoneInfo(args.timezone)
     for expression in (args.cron, args.notify_cron_schedule):
         if expression is not None and (
@@ -109,7 +114,14 @@ async def run_daemon(args, api, website):
                 database.connect(args.db) as db,
                 AmenityClient(timeout=max(60, args.timeout)) as amenity_client,
             ):
-                configure(Runtime(client, db, args.quiet, amenity_client))
+                runtime = Runtime(client, db, args.quiet, amenity_client)
+                configure(runtime)
+                logger.info(
+                    "Daemon starting: database=%s property_workers=%s review_workers=%s.",
+                    args.db.resolve(),
+                    args.concurrency,
+                    args.review_concurrency,
+                )
                 dbos = None
                 try:
                     dbos = DBOS(
@@ -120,17 +132,28 @@ async def run_daemon(args, api, website):
                         }
                     )
                     # Launch on this event loop so queued async work shares the client and limiter.
+                    logger.info("Launching DBOS recovery, queues and schedules.")
                     DBOS.launch()
                     await register_queues(args.concurrency, args.review_concurrency)
                     await DBOS.apply_schedules_async(schedule_inputs(args, discovery, notification))
                     if notification is None:
                         await DBOS.delete_schedule_async("notify")
+                    logger.info(
+                        "Schedules ready: discovery=%r email=%r timezone=%s. Review enabled=%s. --run-now triggers discovery only, not email.",
+                        args.cron,
+                        args.notify_cron_schedule,
+                        args.timezone,
+                        discovery.review is not None,
+                    )
                     if args.run_now:
+                        logger.info("Submitting startup discovery.")
                         await DBOS.enqueue_workflow_async(
                             DISCOVERY_QUEUE, discover, datetime.now(UTC), discovery
                         )
+                    logger.info("Daemon ready; waiting for queued and scheduled work.")
                     await stop.wait()
                 finally:
+                    logger.info("Daemon stopping; cancelling and joining active tasks.")
                     # DBOS 3.2 adopts our main loop but destroy() only cancels its
                     # own background loop. Stop its pollers, then cancel and join
                     # main-loop work before destroy closes its executor/database.
@@ -144,6 +167,7 @@ async def run_daemon(args, api, website):
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
                     await asyncio.to_thread(DBOS.destroy)
+                    logger.info("Daemon stopped.")
                     configure(None)
     finally:
         for sig in (signal.SIGTERM, signal.SIGINT):

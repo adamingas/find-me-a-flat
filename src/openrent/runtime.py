@@ -15,10 +15,6 @@ class Runtime:
     quiet: bool = False
     amenity_client: AmenityClient | None = None
 
-    def report(self, message):
-        if not self.quiet:
-            print(message, flush=True)
-
 
 _runtime: Runtime | None = None
 

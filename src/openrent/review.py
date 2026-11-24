@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import shutil
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from . import db as database
 from .judge import judge_property
 from .model_config import OpenAIConfig, OpenRouterConfig
 from .settings import load_settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -95,11 +98,19 @@ async def assess_property(property_id: int, config: ReviewConfig) -> Assessment:
     from .runtime import resources
 
     runtime = resources()
+    logger.info("%s: review loading evidence.", property_id)
     evidence = await database.get_evidence(runtime.db, property_id)
+    logger.info(
+        "%s: review validating model; backend=%s model=%s timeout_seconds=%s.",
+        property_id,
+        config.backend,
+        config.model,
+        config.timeout,
+    )
     model_config = config.model_configuration()
     if model_config is not None:
         await model_config.validate(images=True, structured_output=True)
-    runtime.report(f"Reviewing {property_id}.")
+    logger.info("Reviewing %s.", property_id)
     judgement = await judge_property(
         evidence,
         config.criteria,
@@ -108,6 +119,7 @@ async def assess_property(property_id: int, config: ReviewConfig) -> Assessment:
         timeout=config.timeout,
         model_config=model_config,
     )
+    logger.info("%s: review assessment complete; decision=%s.", property_id, judgement.decision)
     # Checkpoint the model result and digest facts, never another copy of image bytes.
     return Assessment(
         property_id,
@@ -139,15 +151,23 @@ async def save_assessment(config: ReviewConfig, assessment: Assessment) -> int:
     from .runtime import resources
 
     runtime = resources()
+    logger.info("%s: saving review and notification eligibility.", assessment.property_id)
     review_id = await database.save_review(runtime.db, config, assessment)
     result = json.loads(assessment.result)
-    runtime.report(f"{assessment.property_id}: {result['decision']} — {result['summary']}")
+    logger.info("%s: %s — %s", assessment.property_id, result["decision"], result["summary"])
+    logger.info(
+        "%s: review_id=%s saved; email_eligible=%s.",
+        assessment.property_id,
+        review_id,
+        result["decision"] in {"pass", "uncertain"},
+    )
     return review_id
 
 
 @DBOS.workflow()
 async def review_property(property_id: int, config: ReviewConfig) -> int | None:
     if not await needs_review(property_id):
+        logger.info("%s: review skipped; already reviewed.", property_id)
         return None
     assessment = await assess_property(property_id, config)
     return await save_assessment(config, assessment)
