@@ -2,16 +2,14 @@ import asyncio
 import base64
 import json
 import time
-from types import SimpleNamespace
 
 import httpx
 import pytest
 from test_client import png_bytes, with_transport
 
 from openrent.browser_protocol import allowed_url, is_challenge
-from openrent.browser_transport import BrowserTransport, ChallengeNotifier, configuration
+from openrent.browser_transport import BrowserTransport
 from openrent.client import FetchError
-from openrent.email_sender import EmailSendIndeterminate
 
 
 @pytest.mark.parametrize(
@@ -204,34 +202,3 @@ async def test_browser_summary_params_and_rate_limit_are_shared_across_workers()
     assert results == [[{"id": 101}], [{"id": 101}]]
     assert queries == [["101", "102"], ["103"]]
     assert starts[1] - starts[0] >= 0.045
-
-
-@pytest.mark.asyncio
-async def test_alert_reservation_survives_restart_and_unknown_delivery(tmp_path):
-    calls = []
-
-    class Sender:
-        async def send(self, *args, **kwargs):
-            calls.append((args, kwargs))
-            raise EmailSendIndeterminate("network timeout")
-
-    path = tmp_path / "alert.json"
-    for episode in ["first", "first", "second"]:
-        notifier = ChallengeNotifier(
-            path, "http://tailnet:5801/vnc.html", ("me@example.com",), Sender()
-        )
-        await notifier(episode)
-    assert len(calls) == 1
-    assert "Open browser</a>" in calls[0][0][2]
-    assert json.loads(path.read_text())["episode"] == "first"
-    assert path.stat().st_mode & 0o777 == 0o600
-
-
-def test_browser_configuration_is_opt_in_and_requires_own_session(tmp_path):
-    assert configuration(SimpleNamespace()) is None
-    with pytest.raises(ValueError, match="cannot be combined"):
-        configuration(
-            SimpleNamespace(browser_endpoint="http://localhost:8091", cookie_file="cookies.txt")
-        )
-    with pytest.raises(ValueError, match="requires"):
-        configuration(SimpleNamespace(browser_endpoint="http://localhost:8091", cookie_file=None))

@@ -1,27 +1,28 @@
-# Opt-in overlay: docker compose -f compose.yaml -f compose.browser.yaml up -d --build
+# Both services use the image published by the existing GitHub workflow.
 services:
   openrent:
     environment:
       OPENRENT_BROWSER_ENDPOINT: http://127.0.0.1:8091
       OPENRENT_BROWSER_TOKEN_FILE: /run/secrets/browser_api_token
       OPENRENT_BROWSER_VIEWER_URL: ${OPENRENT_BROWSER_VIEWER_URL:?Set the tailnet noVNC URL}
-      OPENRENT_BROWSER_ALERT_TO: ${OPENRENT_BROWSER_ALERT_TO:-}
+      OPENRENT_BROWSER_ALERT_TO: ${OPENRENT_BROWSER_ALERT_TO:?Set the CAPTCHA alert email recipient}
     secrets:
       - browser_api_token
     depends_on:
       browser:
-        condition: service_started
+        condition: service_healthy
 
   browser:
-    build:
-      context: .
-      dockerfile: Dockerfile.browser
+    image: ghcr.io/adamingas/find-me-a-flat:latest
+    entrypoint: ["/app/.venv/bin/python", "-m", "openrent.browser_worker"]
+    user: "1000:1000"
     restart: unless-stopped
     init: true
     ports:
       - "127.0.0.1:8091:8091"
       - "${BROWSER_TAILNET_IP:?Set the server tailnet IPv4 address}:5801:5800"
     environment:
+      HOME: /home/openrent-browser
       BROWSER_TOKEN_FILE: /run/secrets/browser_api_token
       VNC_PASSWORD_FILE: /run/secrets/browser_vnc_password
       BROWSER_IDLE_SECONDS: "300"
@@ -36,6 +37,12 @@ services:
     memswap_limit: 1g
     cpus: 1
     pids_limit: 512
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-m", "openrent.browser_healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     logging:
       driver: json-file
       options:

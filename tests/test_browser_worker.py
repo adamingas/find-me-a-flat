@@ -41,6 +41,9 @@ async def test_worker_api_requires_auth_and_preserves_upstream_status():
         async with ClientSession(base_url=f"http://127.0.0.1:{port}") as client:
             assert (await client.get("/status")).status == 401
             client.headers["Authorization"] = "Bearer secret"
+            response = await client.get("/status")
+            assert response.status == 200
+            assert (await response.json())["state"] == "idle"
             response = await client.post(
                 "/fetch", json={"url": "https://www.openrent.co.uk/challenge"}
             )

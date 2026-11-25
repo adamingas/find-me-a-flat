@@ -114,14 +114,25 @@ Resend. The same episode is not re-emailed after restart, and different episodes
 have a one-hour alert cooldown. Uncertain delivery is not retried automatically;
 the log link remains available. These alerts are separate from property digests
 and require `--browser-alert-to`; existing digest recipients are not implicitly
-subscribed. No password or API token is put in an email link.
+subscribed. The browser Compose overlay requires `OPENRENT_BROWSER_ALERT_TO`
+so it cannot silently start with log-only alerts. Direct CLI use can still omit
+recipients for log-only operation. No password or API token is put in an email link.
 
 ## Optional deployment
 
-The normal HTTP-only Compose configuration remains the default. This branch adds
-`Dockerfile.browser` and `compose.browser.yaml`; neither changes the existing manual
-`chromium-viewer` container or shares its profile. Use one worker and one application
-for each profile; do not mount a Chromium profile into two live browsers.
+The normal HTTP-only Compose configuration remains the default. The existing
+`Dockerfile` and GitHub workflow build and publish **one image** containing the
+application and browser dependencies. `compose.browser.yaml` runs that image in
+two containers: the application uses the default `schedule.sh` entrypoint; the
+browser service overrides it with `python -m openrent.browser_worker` and runs as
+UID 1000. Chromium starts only inside the browser service when a request needs it.
+The existing manual `chromium-viewer` container and its profile are separate.
+Use one worker and one application for each profile; do not mount a Chromium
+profile into two live browsers.
+
+Publish this branch's image using the existing **Publish container** workflow,
+then copy `compose.yaml` and `compose.browser.yaml` to the server. The server
+pulls the image as before; it does not need a source checkout or a second build.
 
 On the deployment host, create secrets as the ordinary deployment user (the worker
 runs as UID 1000, matching `adamos` on paralimni):
@@ -130,18 +141,42 @@ runs as UID 1000, matching `adamos` on paralimni):
 mkdir -p secrets
 chmod 700 secrets
 umask 077
-openssl rand -hex 32 > secrets/browser-api-token
-openssl rand -hex 4 > secrets/browser-vnc-password
+# Generate once; keep existing secrets on subsequent deployments.
+test -f secrets/browser-api-token || openssl rand -hex 32 > secrets/browser-api-token
+test -f secrets/browser-vnc-password || openssl rand -hex 4 > secrets/browser-vnc-password
 
 export BROWSER_TAILNET_IP=100.64.0.3
 export OPENRENT_BROWSER_VIEWER_URL='http://paralimniserver.tailnet.spanashis.com:5801/vnc.html?autoconnect=1&resize=remote'
-# Optional; whitespace-separated addresses or repeated --browser-alert-to flags.
+# Required for this overlay; multiple addresses are whitespace-separated.
 export OPENRENT_BROWSER_ALERT_TO='your-address@example.com'
+# paralimni currently blocks Chromium's internal user-namespace sandbox.
+# On hosts that support it, omit this and keep the default true.
+export BROWSER_CHROMIUM_SANDBOX=false
 # Export the existing RESEND_TOKEN and review credentials as usual.
 
 docker compose --env-file /dev/null -f compose.yaml -f compose.browser.yaml config --quiet
-docker compose --env-file /dev/null -f compose.yaml -f compose.browser.yaml up -d --build
+docker compose --env-file /dev/null -f compose.yaml -f compose.browser.yaml pull openrent browser
+docker compose --env-file /dev/null -f compose.yaml -f compose.browser.yaml up -d --no-build browser openrent
 ```
+
+For local development, build the shared image with `docker compose build openrent`
+before starting both services. The application waits for the worker's authenticated `/status` healthcheck;
+checking health does not start Chromium, so an idle worker remains inexpensive.
+The existing `RESEND_TOKEN` is passed to the application only. The worker receives
+neither email credentials nor application database access.
+
+To check the deployment afterward:
+
+```sh
+docker compose --env-file /dev/null -f compose.yaml -f compose.browser.yaml ps
+docker compose --env-file /dev/null -f compose.yaml -f compose.browser.yaml logs --tail=100 browser openrent
+```
+
+When an alert arrives, connect the phone/laptop to the tailnet, open the email's
+viewer link, and use the password stored in `secrets/browser-vnc-password`.
+Complete the verification in that browser tab and leave it open. The application
+automatically replays its pending request. The link will be unavailable after
+the browser's idle shutdown until another browser request starts it.
 
 The viewer uses port **5801**, leaving the manual test browser on 5800. It is only
 reachable while Chromium is running. The API is published on host loopback port
@@ -155,10 +190,10 @@ The browser sandbox is enabled by default. It needs host support for unprivilege
 user namespaces and an appropriate Docker seccomp policy; see
 [Playwright's Docker guidance](https://playwright.dev/python/docs/docker).
 The current paralimni manual test browser could not enable its internal sandbox.
-For an explicitly isolated test under those same restrictions,
-`BROWSER_CHROMIUM_SANDBOX=false` selects the same unsandboxed Chromium mode; it does
-not disable Docker's isolation. Resolve that deployment choice before enabling this
-for ongoing browsing. The implementation never silently disables the sandbox.
+The example above explicitly selects `BROWSER_CHROMIUM_SANDBOX=false` for those
+same host restrictions. Docker's isolation remains enabled. On hosts that support
+Chromium's internal sandbox, keep the default `true`; the implementation never
+silently disables it.
 
 To roll back to HTTP mode, recreate the application using only `compose.yaml` and
 stop the browser service. Keep the profile volume. That restores the original
@@ -204,7 +239,11 @@ Implementation entry points:
 - `routing_transport.py`: explicit per-request selection between HTTP and Chromium.
 - `browser_worker.py`: process lifecycle, persistent browser, request serialization,
   challenge detection/waiting, authenticated API.
-- `browser_transport.py`: client polling, reconstructed responses, durable alert
-  suppression, CLI configuration.
+- `browser_transport.py`: client polling and reconstructed responses, with an
+  injected async challenge callback.
+- `browser_notifications.py`: viewer-link email delivery and durable alert suppression.
+- `browser_config.py`: CLI/environment configuration and composition of the transport
+  and notifier.
+- `browser_healthcheck.py`: authenticated worker readiness without starting Chromium.
 - `browser_protocol.py`: URL validation and explicit WAF signals.
 - `client.py` / `daemon.py`: opt-in transport selection and unchanged ingestion API.

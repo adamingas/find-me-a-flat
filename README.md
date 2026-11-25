@@ -109,6 +109,12 @@ persistent Chromium session when OpenRent requires JavaScript or human verificat
 It starts the browser on demand, pauses for verification, and releases browser memory
 after five idle minutes. Enable it explicitly with `compose.browser.yaml` or
 `--browser-endpoint`; the normal HTTP transport remains the default.
+The Compose overlay requires `OPENRENT_BROWSER_ALERT_TO` and
+`OPENRENT_BROWSER_VIEWER_URL` so a persistent challenge emails you a link to the
+same Chromium session. Both services use the same image published by the existing
+workflow, with different entrypoints; the app waits for the worker API to be healthy.
+See the [deployment steps](docs/browser-handoff.md#optional-deployment)
+for secrets, tailnet binding, and the server's Chromium sandbox setting.
 
 DBOS exposes workflow status and recovery controls. Steps retry failures three times; exhausted failures
 remain visible as DBOS errors and require repair and an explicit DBOS rewind. Interrupted
@@ -178,5 +184,8 @@ docker compose --env-file /dev/null up -d --no-build
 
 Pulling alone downloads the image; `up` recreates the container with the new image.
 Schedule and criteria changes require rebuilding the image.
+For browser mode, also copy `compose.browser.yaml` and follow the
+[browser deployment steps](docs/browser-handoff.md#optional-deployment). There is
+still one image to publish; the overlay runs a second container from it.
 
 To verify the pipeline offline, run `uv run pytest` and `uv run ruff check src tests`.

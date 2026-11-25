@@ -12,7 +12,7 @@ from dbos import DBOS
 
 from . import db as database
 from .amenity_client import AmenityClient
-from .browser_transport import configuration as browser_configuration
+from .browser_config import configuration as browser_configuration
 from .client import OpenRentClient
 from .ingestion import (
     DISCOVERY_QUEUE,

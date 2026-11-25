@@ -27,6 +27,27 @@ def scan_flags(*extra):
     return ["--location", "Victoria, London", "--radius-distance", "2", *extra]
 
 
+def test_browser_compose_environment_reaches_daemon(captured_scan, tmp_path):
+    token_file = tmp_path / "browser-api-token"
+    token_file.write_text("a" * 64)
+    result = CliRunner().invoke(
+        cli.app,
+        ["daemon", "--cron", "0 * * * *", *scan_flags()],
+        env={
+            "OPENRENT_BROWSER_ENDPOINT": "http://127.0.0.1:8091",
+            "OPENRENT_BROWSER_TOKEN_FILE": str(token_file),
+            "OPENRENT_BROWSER_VIEWER_URL": "http://tailnet:5801/vnc.html",
+            "OPENRENT_BROWSER_ALERT_TO": "me@example.com second@example.com",
+        },
+    )
+    assert result.exit_code == 0, result.output
+    args = captured_scan[0]
+    assert args.browser_endpoint == "http://127.0.0.1:8091"
+    assert args.browser_token_file == token_file
+    assert args.browser_viewer_url == "http://tailnet:5801/vnc.html"
+    assert args.browser_alert_to == ("me@example.com", "second@example.com")
+
+
 def test_daemon_aliases_and_typed_arguments(captured_scan, tmp_path):
     db = tmp_path / "archive.sqlite"
     cookie_file = tmp_path / "cookies.txt"
