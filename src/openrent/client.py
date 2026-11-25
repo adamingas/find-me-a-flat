@@ -47,12 +47,11 @@ def retry_wait(state):
 def retry_request(operation):
     @wraps(operation)
     async def attempt(self, url, *args, **kwargs):
-        async with self._slots:
-            try:
-                return await operation(self, url, *args, **kwargs)
-            except httpx.HTTPStatusError as exc:
-                log_http_failure(exc.response, "http_status_error")
-                raise
+        try:
+            return await operation(self, url, *args, **kwargs)
+        except httpx.HTTPStatusError as exc:
+            log_http_failure(exc.response, "http_status_error")
+            raise
 
     def log_retry(state):
         logging.getLogger(__name__).warning(
@@ -108,7 +107,6 @@ class OpenRentClient:
             raise ValueError("Concurrency must be positive.")
         if not math.isfinite(requests_per_second) or requests_per_second <= 0:
             raise ValueError("Requests per second must be positive and finite.")
-        self._slots = asyncio.Semaphore(concurrency)
         self._rate_lock = asyncio.Lock()
         self._interval = 1 / requests_per_second
         self._next_request_at = 0.0
@@ -118,7 +116,9 @@ class OpenRentClient:
             self.transport = (
                 transport
                 if transport is not None
-                else HttpFetchTransport(timeout=timeout, cookie_file=cookie_file)
+                else HttpFetchTransport(
+                    timeout=timeout, cookie_file=cookie_file, concurrency=concurrency
+                )
             )
         except ValueError as exc:
             raise FetchError(str(exc)) from exc

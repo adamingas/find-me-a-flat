@@ -18,7 +18,9 @@ async def with_transport(handler, **kwargs):
     kwargs.setdefault("requests_per_second", 1_000_000)
     if "transport" not in kwargs:
         kwargs["transport"] = HttpFetchTransport(
-            http_transport=httpx.MockTransport(handler), cookie_file=kwargs.pop("cookie_file", None)
+            http_transport=httpx.MockTransport(handler),
+            cookie_file=kwargs.pop("cookie_file", None),
+            concurrency=kwargs.get("concurrency", 1),
         )
     client = OpenRentClient(**kwargs)
     async with client:

@@ -15,6 +15,13 @@ per-attempt pacing, response size limits, cancellation, and close semantics.
 between them using an explicit per-request predicate. Playwright stays inside
 the worker container; no runtime methods or library globals are patched.
 The client continues to own retries, rate limiting, validation, and parsing.
+Concurrency belongs to each transport: `HttpFetchTransport(concurrency=...)`
+limits HTTP requests through completion of their response bodies, while Chromium
+keeps its single-session lock. `OpenRentClient(concurrency=...)` configures its
+default HTTP transport; injected transports own their concurrency configuration.
+There is no client-wide slot held while someone completes a CAPTCHA. OpenRent
+request pacing stays shared across both transports; other service clients do not
+use that limiter.
 
 For example, a caller can compose mixed fetching as follows (assuming `browser`
 is an already configured `BrowserTransport`):
@@ -91,7 +98,8 @@ the HTTP photo path, this is not a streaming network-download limit.
    that the pending request succeeded.
 
 The DBOS step waits asynchronously instead of exhausting three retries on a CAPTCHA.
-Other OpenRent browser requests wait behind it; review and digest queues can continue.
+Other OpenRent browser requests wait behind it; HTTP-routed requests, review,
+and digest queues can continue, subject to their own worker/queue capacity.
 SIGTERM cancels the wait normally. Existing DBOS recovery rules still apply: a daemon
 restart can recover interrupted work with the same application version, but this
 does not automatically rewind failures from the previous implementation/version.
@@ -161,8 +169,9 @@ transport, including its susceptibility to the current WAF challenge.
 Client policy tests use a fake `FetchTransport`. Browser RPC tests inject an HTTPX
 mock transport through the constructor, covering our challenge replay, pacing,
 cancellation, and alert suppression rules without replacing client attributes.
-Router tests cover selection, forwarding limits, shared pacing, and cleanup.
-HTTP adapter tests cover concurrent callback isolation and bounded decoding;
+Router tests cover selection, forwarding limits, shared pacing, cleanup, and HTTP
+progress during a CAPTCHA wait. HTTP adapter tests cover concurrency limits,
+capacity release on cancellation, concurrent callback isolation, and bounded decoding;
 existing client tests cover retries, redirect validation, and cancellation.
 These tests exercise application decisions. The opt-in real-browser test is an
 integration check of our worker and deployment wiring, including persistent

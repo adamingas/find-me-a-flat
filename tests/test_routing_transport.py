@@ -6,7 +6,9 @@ import time
 import httpx
 import pytest
 
+from openrent.browser_transport import BrowserTransport
 from openrent.client import OpenRentClient
+from openrent.http_transport import HttpFetchTransport
 from openrent.routing_transport import RoutingFetchTransport
 
 
@@ -78,6 +80,39 @@ async def test_mixed_requests_share_client_rate_limit():
     times = sorted([http.calls[0][2], browser.calls[0][2]])
     assert times[1] - times[0] >= 0.045
     assert http.closed == browser.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_captcha_wait_does_not_consume_http_capacity():
+    challenged = asyncio.Event()
+
+    async def notify(_):
+        challenged.set()
+
+    browser = BrowserTransport(
+        "http://worker",
+        "test",
+        notify,
+        poll_seconds=60,
+        http_transport=httpx.MockTransport(
+            lambda _: httpx.Response(423, json={"episode": "waiting"})
+        ),
+    )
+    http = HttpFetchTransport(
+        concurrency=1,
+        http_transport=httpx.MockTransport(lambda _: httpx.Response(200, text="ready")),
+    )
+    router = RoutingFetchTransport(http, browser, lambda request: request.url.path == "/browser")
+    async with OpenRentClient(transport=router, requests_per_second=1_000_000) as client:
+        waiting = asyncio.create_task(client.get("https://www.openrent.co.uk/browser"))
+        try:
+            await asyncio.wait_for(challenged.wait(), 1)
+            response = await asyncio.wait_for(client.get("https://www.openrent.co.uk/http"), 1)
+            assert response.text == "ready"
+            assert not waiting.done()
+        finally:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
 
 
 @pytest.mark.asyncio

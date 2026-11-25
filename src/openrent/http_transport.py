@@ -1,5 +1,6 @@
 """Asynchronous HTTP implementation of the application's fetch contract."""
 
+import asyncio
 import http.cookiejar
 from contextvars import ContextVar
 from pathlib import Path
@@ -20,9 +21,13 @@ class HttpFetchTransport(FetchTransport):
         self,
         *,
         timeout: float = 30,
+        concurrency: int = 1,
         cookie_file: Path | None = None,
         http_transport: httpx.AsyncBaseTransport | None = None,
     ):
+        if concurrency < 1:
+            raise ValueError("Concurrency must be positive.")
+        self._slots = asyncio.Semaphore(concurrency)
         cookies = None
         if cookie_file:
             cookies = http.cookiejar.MozillaCookieJar(str(cookie_file))
@@ -64,7 +69,10 @@ class HttpFetchTransport(FetchTransport):
     ) -> httpx.Response:
         token = self._before_request.set(before_request)
         try:
-            async with self.http.stream("GET", url, params=params, headers=headers) as response:
+            async with (
+                self._slots,
+                self.http.stream("GET", url, params=params, headers=headers) as response,
+            ):
                 if max_bytes is None:
                     await response.aread()
                     return response

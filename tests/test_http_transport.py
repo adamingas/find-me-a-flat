@@ -10,6 +10,57 @@ from openrent.fetch_transport import ResponseTooLarge
 from openrent.http_transport import HttpFetchTransport
 
 
+@pytest.mark.parametrize("concurrency", [1, 2])
+@pytest.mark.asyncio
+async def test_http_capacity_covers_body_reading_and_is_released_on_cancellation(concurrency):
+    entered = asyncio.Queue()
+    release = asyncio.Event()
+    active = 0
+    peak = 0
+
+    class SlowBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            await release.wait()
+            yield b"done"
+
+        async def aclose(self):
+            nonlocal active
+            active -= 1
+
+    def handler(request):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        entered.put_nowait(request.url.path)
+        return httpx.Response(200, stream=SlowBody())
+
+    transport = HttpFetchTransport(
+        concurrency=concurrency, http_transport=httpx.MockTransport(handler)
+    )
+    tasks = []
+    try:
+        for number in range(concurrency):
+            tasks.append(asyncio.create_task(transport.get(f"https://www.openrent.co.uk/{number}")))
+            assert await asyncio.wait_for(entered.get(), 1) == f"/{number}"
+        tasks.append(asyncio.create_task(transport.get("https://www.openrent.co.uk/next")))
+        await asyncio.sleep(0)
+        assert entered.empty()
+        tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tasks[0]
+        assert await asyncio.wait_for(entered.get(), 1) == "/next"
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(*tasks[1:]), 1)
+        assert all(response.content == b"done" for response in results)
+        assert peak == concurrency
+        assert active == 0
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await transport.aclose()
+
+
 @pytest.mark.asyncio
 async def test_concurrent_fetches_keep_their_own_callback_across_redirects():
     barrier = asyncio.Barrier(2)
@@ -21,7 +72,7 @@ async def test_concurrent_fetches_keep_their_own_callback_across_redirects():
             return httpx.Response(302, headers={"Location": request.url.path + "/end"})
         return httpx.Response(200, content=b"done")
 
-    transport = HttpFetchTransport(http_transport=httpx.MockTransport(handler))
+    transport = HttpFetchTransport(http_transport=httpx.MockTransport(handler), concurrency=2)
 
     async def fetch(name):
         async def pace(request):
