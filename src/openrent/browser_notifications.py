@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class ChallengeNotifier:
     """Reserve before sending: ambiguous delivery must not create an alert storm."""
 
-    def __init__(self, path, viewer_url, recipients=(), sender=None, cooldown=3600):
+    def __init__(self, path, viewer_url, recipients, sender, cooldown=3600):
         self.path = Path(path)
         self.viewer_url = viewer_url
         self.recipients = recipients
@@ -28,9 +28,6 @@ class ChallengeNotifier:
         if episode == self._seen:
             return
         logger.warning("OpenRent needs browser attention. Open %s", self.viewer_url)
-        if not self.sender:
-            self._seen = episode
-            return
         try:
             previous = json.loads(self.path.read_text())
         except FileNotFoundError:

@@ -125,7 +125,7 @@ def request_flags(command):
             click.option(
                 "--browser-endpoint",
                 envvar="OPENRENT_BROWSER_ENDPOINT",
-                help="Optional browser worker API URL; routes OpenRent requests through Chromium.",
+                help="Browser worker API URL; routes OpenRent requests through Chromium.",
             ),
             click.option(
                 "--browser-token-file",
@@ -141,7 +141,7 @@ def request_flags(command):
                 "--browser-alert-to",
                 multiple=True,
                 envvar="OPENRENT_BROWSER_ALERT_TO",
-                help="Send verification alerts to this address (repeatable; opt-in).",
+                help="Send verification alerts to this address (repeatable; required in browser mode).",
             ),
             click.option("--quiet", is_flag=True),
         ]

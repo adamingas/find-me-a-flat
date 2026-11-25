@@ -9,12 +9,22 @@ services:
     # The existing app connects to the map services on host loopback (Linux).
     network_mode: host
     depends_on:
-      - overpass
-      - valhalla
+      overpass:
+        condition: service_started
+      valhalla:
+        condition: service_started
+      browser:
+        condition: service_healthy
     environment:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-${OPENROUTER_TOKEN:-}}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       RESEND_TOKEN: ${RESEND_TOKEN:?Set RESEND_TOKEN in your environment}
+      OPENRENT_BROWSER_ENDPOINT: http://127.0.0.1:8091
+      OPENRENT_BROWSER_TOKEN_FILE: /run/secrets/browser_api_token
+      OPENRENT_BROWSER_VIEWER_URL: ${OPENRENT_BROWSER_VIEWER_URL:?Set the tailnet noVNC URL}
+      OPENRENT_BROWSER_ALERT_TO: ${OPENRENT_BROWSER_ALERT_TO:?Set the CAPTCHA alert email recipient}
+    secrets:
+      - browser_api_token
     volumes:
       - openrent-data:/app/data
     logging:
@@ -22,6 +32,43 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  browser:
+    image: ghcr.io/adamingas/find-me-a-flat:latest
+    entrypoint: ["/app/.venv/bin/python", "-m", "openrent.browser_worker"]
+    user: "1000:1000"
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8091:8091"
+      - "${BROWSER_TAILNET_IP:?Set the server tailnet IPv4 address}:5801:5800"
+    environment:
+      HOME: /home/openrent-browser
+      BROWSER_TOKEN_FILE: /run/secrets/browser_api_token
+      VNC_PASSWORD_FILE: /run/secrets/browser_vnc_password
+      BROWSER_IDLE_SECONDS: "300"
+      BROWSER_CHROMIUM_SANDBOX: ${BROWSER_CHROMIUM_SANDBOX:-true}
+    secrets:
+      - browser_api_token
+      - browser_vnc_password
+    volumes:
+      - browser-profile:/state
+    shm_size: 256m
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 1
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-m", "openrent.browser_healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
 
   overpass:
     image: wiktorn/overpass-api@sha256:5f643f2aa500333f19458fe8be14457215d6e0b9f891ca5c5ed452b1f8882c47
@@ -87,7 +134,14 @@ services:
         max-size: "10m"
         max-file: "3"
 
+secrets:
+  browser_api_token:
+    file: ./secrets/browser-api-token
+  browser_vnc_password:
+    file: ./secrets/browser-vnc-password
+
 volumes:
   openrent-data:
   overpass-data:
   valhalla-data:
+  browser-profile:

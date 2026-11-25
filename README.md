@@ -23,11 +23,13 @@ plaintext env file cannot be hidden by encrypting it in a later commit. Local Gi
 be bypassed, so use a server-side push rule as well if this must be enforced for every
 contributor. See [.pre-commit-config.yaml](.pre-commit-config.yaml) for the hook definitions.
 
-Start the local map services to provide fallback for public requests:
+Configure the Compose environment and secrets using the
+[deployment steps](docs/browser-handoff.md#deployment), then start the local map
+services to provide fallback for public requests:
 
 ```sh
-docker compose up -d overpass valhalla
-docker compose logs -f overpass valhalla
+docker compose --env-file /dev/null up -d overpass valhalla
+docker compose --env-file /dev/null logs -f overpass valhalla
 ```
 
 The first start imports Greater London's OpenStreetMap data into Overpass and builds
@@ -39,7 +41,7 @@ Docker restarts. The app resends failed public Overpass requests to
 The Overpass image's built-in updater applies regional changes daily. To update manually:
 
 ```sh
-docker compose exec --user overpass overpass /app/bin/update_overpass.sh
+docker compose --env-file /dev/null exec --user overpass overpass /app/bin/update_overpass.sh
 ```
 
 Valhalla uses `https://valhalla1.openstreetmap.de/sources_to_targets` first and falls back to
@@ -100,20 +102,19 @@ but before review was queued. Completed properties and reviews are not repeated 
 discovery. Workflow inputs retain the original filters and criteria. Pydantic Settings loads
 credentials once at startup, with process variables overriding the env file; restart to reload.
 
-All OpenRent requests share one HTTP client, concurrency bound and rate limiter, including
-redirects and retries. Review agents have their own concurrency limit. Omit
+OpenRent requests share a rate limiter. HTTP fetching has its own concurrency
+bound; browser fetching serializes access to its shared tab. Review agents have
+their own concurrency limit. Omit
 `--criteria-file` to archive without review. See [the filter reference](docs/reference.md).
 
-An optional [browser transport with noVNC handoff](docs/browser-handoff.md) reuses a
-persistent Chromium session when OpenRent requires JavaScript or human verification.
-It starts the browser on demand, pauses for verification, and releases browser memory
-after five idle minutes. Enable it explicitly with `compose.browser.yaml` or
-`--browser-endpoint`; the normal HTTP transport remains the default.
-The Compose overlay requires `OPENRENT_BROWSER_ALERT_TO` and
-`OPENRENT_BROWSER_VIEWER_URL` so a persistent challenge emails you a link to the
-same Chromium session. Both services use the same image published by the existing
-workflow, with different entrypoints; the app waits for the worker API to be healthy.
-See the [deployment steps](docs/browser-handoff.md#optional-deployment)
+The Compose deployment uses a [browser transport with noVNC handoff](docs/browser-handoff.md)
+to reuse a persistent Chromium session for OpenRent requests. It starts the browser
+on demand, pauses for verification, and releases browser memory after five idle minutes.
+When a challenge persists, the worker reports it to the application, which emails
+the `OPENRENT_BROWSER_VIEWER_URL` link to `OPENRENT_BROWSER_ALERT_TO`.
+Both services use the same published image with different entrypoints; the application
+waits for the worker API to be healthy. HTTP and mixed transports remain available
+for direct CLI and Python use. See the [deployment steps](docs/browser-handoff.md#deployment)
 for secrets, tailnet binding, and the server's Chromium sandbox setting.
 
 DBOS exposes workflow status and recovery controls. Steps retry failures three times; exhausted failures
@@ -143,14 +144,18 @@ The application uses one schema and storage layer for properties, reviews and no
 ### Docker Compose (Linux)
 
 The `openrent` container runs the unchanged `schedule.sh`: discovery, reviews and
-scheduled email notifications run together. Overpass and Valhalla remain separate
-Compose services. Host networking preserves the application's existing localhost map URLs.
+scheduled email notifications run together. The `browser` container runs the worker
+from the same image. Overpass and Valhalla remain separate Compose services.
+Host networking preserves the application's existing localhost map URLs.
 
 Export `OPENROUTER_API_KEY` (or `OPENROUTER_TOKEN`) and `RESEND_TOKEN` in your shell,
-then build and start everything:
+and configure the browser environment and secret files described in the
+[deployment steps](docs/browser-handoff.md#deployment). For local development,
+build the shared image and start everything:
 
 ```sh
-docker compose --env-file /dev/null up -d --build
+docker compose --env-file /dev/null build openrent
+docker compose --env-file /dev/null up -d --no-build
 docker compose --env-file /dev/null logs -f openrent
 ```
 
@@ -168,14 +173,15 @@ map requests may fail until they are ready.
 
 ### Publish and pull
 
-Push these files to GitHub, then run the **Publish container** workflow from Actions.
+Merge changes into `main`, then run the **Publish container** workflow from Actions
+on `main`. Publishing is restricted to that branch.
 It builds Linux amd64 and arm64 images and pushes them to
 `ghcr.io/adamingas/find-me-a-flat:latest`, plus a tag for the commit.
 For a private package, authenticate the server to GHCR with an account/token that
 has permission to read it.
 
-After publishing, the server only needs `compose.yaml` and the exported environment
-variables:
+After publishing, the server needs `compose.yaml`, the browser secret files, and
+the exported environment variables:
 
 ```sh
 docker compose --env-file /dev/null pull
@@ -184,8 +190,7 @@ docker compose --env-file /dev/null up -d --no-build
 
 Pulling alone downloads the image; `up` recreates the container with the new image.
 Schedule and criteria changes require rebuilding the image.
-For browser mode, also copy `compose.browser.yaml` and follow the
-[browser deployment steps](docs/browser-handoff.md#optional-deployment). There is
-still one image to publish; the overlay runs a second container from it.
+There is one image to publish; Compose runs the application and browser worker
+as separate containers from it.
 
 To verify the pipeline offline, run `uv run pytest` and `uv run ruff check src tests`.

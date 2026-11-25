@@ -8,7 +8,7 @@ from openrent.browser_transport import BrowserTransport
 from openrent.email_sender import ResendEmailSender
 
 
-def test_browser_configuration_is_opt_in_and_requires_own_session(tmp_path):
+def test_http_selection_and_browser_session_validation(tmp_path):
     assert configuration(SimpleNamespace()) is None
     with pytest.raises(ValueError, match="cannot be combined"):
         configuration(
@@ -16,6 +16,21 @@ def test_browser_configuration_is_opt_in_and_requires_own_session(tmp_path):
         )
     with pytest.raises(ValueError, match="requires"):
         configuration(SimpleNamespace(browser_endpoint="http://localhost:8091", cookie_file=None))
+
+
+def test_browser_mode_cannot_silently_disable_email(tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("a" * 64)
+    with pytest.raises(ValueError, match="browser-alert-to"):
+        configuration(
+            SimpleNamespace(
+                browser_endpoint="http://localhost:8091",
+                cookie_file=None,
+                browser_token_file=token_file,
+                browser_viewer_url="http://tailnet:5801/vnc.html",
+                browser_alert_to=(),
+            )
+        )
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,7 @@ separate browser did not unlock the application's HTTP client on paralimni.
 `OpenRentClient(transport=...)` uses the `FetchTransport` protocol for every
 OpenRent document, summary, and image fetch. The protocol defines buffered `get`,
 per-attempt pacing, response size limits, cancellation, and close semantics.
-`HttpFetchTransport` uses asynchronous HTTPX requests and is the default.
+`HttpFetchTransport` uses asynchronous HTTPX requests and is the library default.
 `BrowserTransport` uses the Chromium worker. `RoutingFetchTransport` chooses
 between them using an explicit per-request predicate. Playwright stays inside
 the worker container; no runtime methods or library globals are patched.
@@ -46,7 +46,8 @@ HTTP. The router closes both transports and passes the same rate-limit callback
 to either one. It does not switch automatically after a challenge or transfer
 cookies: HTTP and Chromium keep separate sessions. CLI configuration still
 selects HTTP by default or all-browser fetching with `--browser-endpoint`;
-mixed routing is currently a Python composition option. Map and email service
+mixed routing is a Python composition option. The Compose deployment configures
+Chromium for all OpenRent fetching. Map and email service
 clients are outside this OpenRent fetch interface.
 
 ```mermaid
@@ -55,14 +56,14 @@ flowchart LR
     B --> C[One persistent Chromium session]
     C --> D[OpenRent]
     B -->|Challenge persists| E[Pause requests]
-    E --> F[Log viewer link and optionally email it]
+    E -->|Challenge status via API| F[Application emails viewer link]
     F --> G[Phone or laptop on tailnet]
     G -->|Password-protected noVNC| C
     C -->|Verification clears| H[Replay original request]
     H --> A
 ```
 
-The optional browser container runs a small Python API. The first request starts
+The browser container runs a small Python API. The first request starts
 Chromium, its virtual display, and noVNC. Subsequent requests reuse the **same live
 tab and profile**. The user sees that exact tab. The browser, display, and viewer
 stop after five idle minutes; the API remains available to start them again.
@@ -90,8 +91,8 @@ the HTTP photo path, this is not a streaming network-download limit.
 2. Allow 15 seconds for JavaScript verification to finish automatically.
 3. If it persists, return `423` with an episode identifier. Keep the browser open,
    exempt it from idle shutdown, and stop new navigations.
-4. The application logs the viewer link and optionally emails explicitly configured
-   recipients. Poll the worker every ten seconds without refreshing the challenge.
+4. The application logs the viewer link and emails the configured recipients.
+   Poll the worker every ten seconds without refreshing the challenge.
 5. After the user completes verification and the browser receives a normal
    OpenRent document, replay the original request in that session. Only that
    response goes to the application. Navigating to an unrelated page is not proof
@@ -114,15 +115,16 @@ Resend. The same episode is not re-emailed after restart, and different episodes
 have a one-hour alert cooldown. Uncertain delivery is not retried automatically;
 the log link remains available. These alerts are separate from property digests
 and require `--browser-alert-to`; existing digest recipients are not implicitly
-subscribed. The browser Compose overlay requires `OPENRENT_BROWSER_ALERT_TO`
-so it cannot silently start with log-only alerts. Direct CLI use can still omit
-recipients for log-only operation. No password or API token is put in an email link.
+subscribed. Application startup requires an alert recipient and Resend credentials
+when selecting browser fetching. The worker only reports challenge status; it has
+no notification logic or email credentials. The application configuration module
+wires a notifier callback into its browser transport. No password or API token is
+put in an email link.
 
-## Optional deployment
+## Deployment
 
-The normal HTTP-only Compose configuration remains the default. The existing
-`Dockerfile` and GitHub workflow build and publish **one image** containing the
-application and browser dependencies. `compose.browser.yaml` runs that image in
+The `Dockerfile` and GitHub workflow build and publish **one image** containing the
+application and browser dependencies. `compose.yaml` runs that image in
 two containers: the application uses the default `schedule.sh` entrypoint; the
 browser service overrides it with `python -m openrent.browser_worker` and runs as
 UID 1000. Chromium starts only inside the browser service when a request needs it.
@@ -130,8 +132,8 @@ The existing manual `chromium-viewer` container and its profile are separate.
 Use one worker and one application for each profile; do not mount a Chromium
 profile into two live browsers.
 
-Publish this branch's image using the existing **Publish container** workflow,
-then copy `compose.yaml` and `compose.browser.yaml` to the server. The server
+After merging into `main`, publish its image using the **Publish container** workflow,
+then copy `compose.yaml` to the server. Publishing is restricted to `main`. The server
 pulls the image as before; it does not need a source checkout or a second build.
 
 On the deployment host, create secrets as the ordinary deployment user (the worker
@@ -147,19 +149,19 @@ test -f secrets/browser-vnc-password || openssl rand -hex 4 > secrets/browser-vn
 
 export BROWSER_TAILNET_IP=100.64.0.3
 export OPENRENT_BROWSER_VIEWER_URL='http://paralimniserver.tailnet.spanashis.com:5801/vnc.html?autoconnect=1&resize=remote'
-# Required for this overlay; multiple addresses are whitespace-separated.
+# Multiple alert addresses are whitespace-separated.
 export OPENRENT_BROWSER_ALERT_TO='your-address@example.com'
 # paralimni currently blocks Chromium's internal user-namespace sandbox.
 # On hosts that support it, omit this and keep the default true.
 export BROWSER_CHROMIUM_SANDBOX=false
 # Export the existing RESEND_TOKEN and review credentials as usual.
 
-docker compose --env-file /dev/null -f compose.yaml -f compose.browser.yaml config --quiet
-docker compose --env-file /dev/null -f compose.yaml -f compose.browser.yaml pull openrent browser
-docker compose --env-file /dev/null -f compose.yaml -f compose.browser.yaml up -d --no-build browser openrent
+docker compose --env-file /dev/null config --quiet
+docker compose --env-file /dev/null pull openrent browser
+docker compose --env-file /dev/null up -d --no-build browser openrent
 ```
 
-For local development, build the shared image with `docker compose build openrent`
+For local development, build the shared image with `docker compose --env-file /dev/null build openrent`
 before starting both services. The application waits for the worker's authenticated `/status` healthcheck;
 checking health does not start Chromium, so an idle worker remains inexpensive.
 The existing `RESEND_TOKEN` is passed to the application only. The worker receives
@@ -168,8 +170,8 @@ neither email credentials nor application database access.
 To check the deployment afterward:
 
 ```sh
-docker compose --env-file /dev/null -f compose.yaml -f compose.browser.yaml ps
-docker compose --env-file /dev/null -f compose.yaml -f compose.browser.yaml logs --tail=100 browser openrent
+docker compose --env-file /dev/null ps
+docker compose --env-file /dev/null logs --tail=100 browser openrent
 ```
 
 When an alert arrives, connect the phone/laptop to the tailnet, open the email's
@@ -195,10 +197,6 @@ same host restrictions. Docker's isolation remains enabled. On hosts that suppor
 Chromium's internal sandbox, keep the default `true`; the implementation never
 silently disables it.
 
-To roll back to HTTP mode, recreate the application using only `compose.yaml` and
-stop the browser service. Keep the profile volume. That restores the original
-transport, including its susceptibility to the current WAF challenge.
-
 ## Validation and rollout
 
 Client policy tests use a fake `FetchTransport`. Browser RPC tests inject an HTTPX
@@ -208,7 +206,7 @@ Router tests cover selection, forwarding limits, shared pacing, cleanup, and HTT
 progress during a CAPTCHA wait. HTTP adapter tests cover concurrency limits,
 capacity release on cancellation, concurrent callback isolation, and bounded decoding;
 existing client tests cover retries, redirect validation, and cancellation.
-These tests exercise application decisions. The opt-in real-browser test is an
+These tests exercise application decisions. The real-browser test is an
 integration check of our worker and deployment wiring, including persistent
 profile configuration and viewer authentication, rather than a unit test of
 Chromium or Playwright internals.
@@ -246,4 +244,4 @@ Implementation entry points:
   and notifier.
 - `browser_healthcheck.py`: authenticated worker readiness without starting Chromium.
 - `browser_protocol.py`: URL validation and explicit WAF signals.
-- `client.py` / `daemon.py`: opt-in transport selection and unchanged ingestion API.
+- `client.py` / `daemon.py`: transport composition and ingestion API.

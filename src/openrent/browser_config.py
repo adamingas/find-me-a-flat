@@ -1,4 +1,4 @@
-"""Compose CLI settings, browser transport, and optional attention emails."""
+"""Compose CLI settings, browser transport, and attention emails."""
 
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -33,10 +33,10 @@ def configuration(args):
     if len(token) < 32 or any(c.isspace() for c in token):
         raise ValueError("Browser API token must contain at least 32 non-whitespace characters.")
     recipients = tuple(dict.fromkeys(validate_recipient(r) for r in args.browser_alert_to))
-    sender = None
-    if recipients:
-        token_config = load_settings(Path(args.env_file or ".env").resolve()).resend_token
-        sender = ResendEmailSender(ResendEmailConfig(token_config, args.email_timeout))
+    if not recipients:
+        raise ValueError("Browser mode requires at least one --browser-alert-to recipient.")
+    token_config = load_settings(Path(args.env_file or ".env").resolve()).resend_token
+    sender = ResendEmailSender(ResendEmailConfig(token_config, args.email_timeout))
     notifier = ChallengeNotifier(
         Path(str(args.db) + ".browser-alert.json"), viewer_url, recipients, sender
     )

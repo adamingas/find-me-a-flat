@@ -1,4 +1,4 @@
-"""Small shared contract for the optional browser worker."""
+"""Shared URL and challenge rules for browser fetching."""
 
 from urllib.parse import urlsplit
 
