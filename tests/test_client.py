@@ -10,12 +10,17 @@ import pytest
 from PIL import Image
 
 from openrent.client import FetchError, OpenRentClient
+from openrent.http_transport import HttpFetchTransport
 
 
 @asynccontextmanager
 async def with_transport(handler, **kwargs):
     kwargs.setdefault("requests_per_second", 1_000_000)
-    client = OpenRentClient(http_transport=httpx.MockTransport(handler), **kwargs)
+    if "transport" not in kwargs:
+        kwargs["transport"] = HttpFetchTransport(
+            http_transport=httpx.MockTransport(handler), cookie_file=kwargs.pop("cookie_file", None)
+        )
+    client = OpenRentClient(**kwargs)
     async with client:
         yield client
 

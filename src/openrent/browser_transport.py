@@ -15,7 +15,13 @@ import httpx
 
 from .browser_protocol import MAX_BODY_BYTES, allowed_url
 from .email_sender import EmailSendError, ResendEmailConfig, ResendEmailSender, validate_recipient
-from .fetch_transport import BeforeRequest, FetchTransport, QueryParams, RequestHeaders
+from .fetch_transport import (
+    BeforeRequest,
+    FetchTransport,
+    QueryParams,
+    RequestHeaders,
+    ResponseTooLarge,
+)
 from .settings import load_settings
 
 logger = logging.getLogger(__name__)
@@ -110,6 +116,7 @@ class BrowserTransport(FetchTransport):
         params: QueryParams | None = None,
         headers: RequestHeaders | None = None,
         before_request: BeforeRequest | None = None,
+        max_bytes: int | None = None,
     ) -> httpx.Response:
         request = httpx.Request("GET", url, params=params, headers=headers)
         async with self._lock:
@@ -139,6 +146,8 @@ class BrowserTransport(FetchTransport):
                 content = base64.b64decode(encoded, validate=True)
                 if len(content) > MAX_BODY_BYTES:
                     raise ValueError("Browser response exceeds the 25 MiB limit.")
+                if max_bytes is not None and len(content) > max_bytes:
+                    raise ResponseTooLarge(f"Response exceeds {max_bytes} bytes")
                 return httpx.Response(
                     result["status"],
                     headers=result["headers"],

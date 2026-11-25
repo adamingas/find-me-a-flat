@@ -22,6 +22,7 @@ class FakeTransport(FetchTransport):
         params: QueryParams | None = None,
         headers: RequestHeaders | None = None,
         before_request: BeforeRequest | None = None,
+        max_bytes: int | None = None,
     ) -> httpx.Response:
         request = httpx.Request("GET", url, params=params, headers=headers)
         self.requests.append(request)
@@ -34,14 +35,7 @@ class FakeTransport(FetchTransport):
 
 
 def client_using(transport: FetchTransport):
-    def unexpected_http(_):
-        pytest.fail("Browser mode must route all OpenRent requests through the injected transport")
-
-    return OpenRentClient(
-        browser=transport,
-        requests_per_second=1_000_000,
-        http_transport=httpx.MockTransport(unexpected_http),
-    )
+    return OpenRentClient(transport=transport, requests_per_second=1_000_000)
 
 
 @pytest.mark.asyncio

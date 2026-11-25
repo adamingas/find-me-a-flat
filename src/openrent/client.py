@@ -1,7 +1,6 @@
 """Asynchronous requests to OpenRent and its public summary API."""
 
 import asyncio
-import http.cookiejar
 import io
 import logging
 import math
@@ -16,8 +15,9 @@ from PIL import Image as PILImage
 from tenacity import retry, retry_if_exception, stop_after_attempt
 
 from .browser_protocol import is_challenge
-from .fetch_transport import FetchTransport
+from .fetch_transport import FetchTransport, ResponseTooLarge
 from .http_logging import log_http_failure, safe_url
+from .http_transport import HttpFetchTransport
 
 BASE_URL = "https://www.openrent.co.uk"
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
@@ -99,9 +99,8 @@ class OpenRentClient:
         concurrency: int = 1,
         requests_per_second: float = 0.2,
         cookie_file: Path | None = None,
-        browser: FetchTransport | None = None,
         *,
-        http_transport: httpx.AsyncBaseTransport | None = None,
+        transport: FetchTransport | None = None,
     ):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Timeout must be positive.")
@@ -113,37 +112,22 @@ class OpenRentClient:
         self._rate_lock = asyncio.Lock()
         self._interval = 1 / requests_per_second
         self._next_request_at = 0.0
-        self.browser = browser
-        cookies = None
-        if cookie_file:
-            cookies = http.cookiejar.MozillaCookieJar(str(cookie_file))
-            try:
-                cookies.load(ignore_discard=True, ignore_expires=False)
-            except (OSError, http.cookiejar.LoadError) as exc:
-                raise FetchError(f"Cannot read Netscape cookie file: {exc}") from exc
-        self.http = httpx.AsyncClient(
-            transport=http_transport,
-            follow_redirects=True,
-            timeout=timeout,
-            cookies=cookies,
-            event_hooks={"request": [self._on_request]},
-            headers={
-                "User-Agent": "openrent-fetch/0.1 (personal rental search)",
-                "Referer": BASE_URL + "/",
-                "Accept": "text/html,application/json,image/*;q=0.9,*/*;q=0.5",
-            },
-        )
+        if transport is not None and cookie_file is not None:
+            raise ValueError("Configure cookie_file on the injected HTTP transport.")
+        try:
+            self.transport = (
+                transport
+                if transport is not None
+                else HttpFetchTransport(timeout=timeout, cookie_file=cookie_file)
+            )
+        except ValueError as exc:
+            raise FetchError(str(exc)) from exc
 
     async def __aenter__(self):
-        await self.http.__aenter__()
         return self
 
     async def __aexit__(self, *args):
-        try:
-            if self.browser:
-                await self.browser.aclose()
-        finally:
-            await self.http.__aexit__(*args)
+        await self.transport.aclose()
 
     async def _on_request(self, request):
         # Count every HTTP attempt, including redirects and retries.
@@ -180,12 +164,9 @@ class OpenRentClient:
     @retry_request
     async def get(self, url, params=None, headers=None) -> httpx.Response:
         self._check_url(url)
-        if self.browser:
-            response = await self.browser.get(
-                url, params=params, headers=headers, before_request=self._on_request
-            )
-        else:
-            response = await self.http.get(url, params=params, headers=headers)
+        response = await self.transport.get(
+            url, params=params, headers=headers, before_request=self._on_request
+        )
         self._check_access(response)
         if is_challenge(response.headers, response.content):
             raise FetchError("OpenRent returned a browser challenge instead of listing data.")
@@ -236,25 +217,16 @@ class OpenRentClient:
     async def image(self, url):
         """Stream and verify photos, rejecting error pages and oversized downloads."""
         self._check_url(url)
-        if self.browser:
-            response = await self.browser.get(url, before_request=self._on_request)
-            self._check_access(response)
-            response.raise_for_status()
-            content = response.content
-            if len(content) > MAX_IMAGE_BYTES:
-                raise FetchError("Image exceeds the 25 MiB download limit.")
-            mime, dimensions = await asyncio.to_thread(self._verify_image, content, url)
-            return content, mime, dimensions, response.headers
-        async with self.http.stream("GET", url) as response:
-            self._check_access(response)
-            response.raise_for_status()
-            chunks, size = [], 0
-            async for chunk in response.aiter_bytes():
-                size += len(chunk)
-                if size > MAX_IMAGE_BYTES:
-                    raise FetchError("Image exceeds the 25 MiB download limit.")
-                chunks.append(chunk)
-            content = b"".join(chunks)
-            headers = response.headers
+        try:
+            response = await self.transport.get(
+                url, before_request=self._on_request, max_bytes=MAX_IMAGE_BYTES
+            )
+        except ResponseTooLarge as exc:
+            raise FetchError("Image exceeds the 25 MiB download limit.") from exc
+        self._check_access(response)
+        response.raise_for_status()
+        content = response.content
+        if len(content) > MAX_IMAGE_BYTES:
+            raise FetchError("Image exceeds the 25 MiB download limit.")
         mime, dimensions = await asyncio.to_thread(self._verify_image, content, url)
-        return content, mime, dimensions, headers
+        return content, mime, dimensions, response.headers

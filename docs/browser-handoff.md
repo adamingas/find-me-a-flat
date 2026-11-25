@@ -7,11 +7,40 @@ separate browser did not unlock the application's HTTP client on paralimni.
 
 ## Design
 
-`OpenRentClient` accepts the `FetchTransport` protocol through its constructor.
-The protocol defines buffered `get`, per-attempt pacing, cancellation, and close
-semantics. `BrowserTransport` implements it in a separate module; Playwright stays
-inside the worker container. No runtime methods or library globals are patched.
-The client continues to own response validation, parsing, and image checks.
+`OpenRentClient(transport=...)` uses the `FetchTransport` protocol for every
+OpenRent document, summary, and image fetch. The protocol defines buffered `get`,
+per-attempt pacing, response size limits, cancellation, and close semantics.
+`HttpFetchTransport` uses asynchronous HTTPX requests and is the default.
+`BrowserTransport` uses the Chromium worker. `RoutingFetchTransport` chooses
+between them using an explicit per-request predicate. Playwright stays inside
+the worker container; no runtime methods or library globals are patched.
+The client continues to own retries, rate limiting, validation, and parsing.
+
+For example, a caller can compose mixed fetching as follows (assuming `browser`
+is an already configured `BrowserTransport`):
+
+```python
+from openrent.client import OpenRentClient
+from openrent.http_transport import HttpFetchTransport
+from openrent.routing_transport import RoutingFetchTransport
+
+transport = RoutingFetchTransport(
+    http=HttpFetchTransport(),
+    browser=browser,
+    use_browser=lambda request: request.url.host == "www.openrent.co.uk",
+)
+async with OpenRentClient(transport=transport) as client:
+    response = await client.search({"term": "London"})
+```
+
+That example routes the main site through Chromium and other OpenRent hosts
+through HTTP. It illustrates routing, not a guarantee that image hosts accept
+HTTP. The router closes both transports and passes the same rate-limit callback
+to either one. It does not switch automatically after a challenge or transfer
+cookies: HTTP and Chromium keep separate sessions. CLI configuration still
+selects HTTP by default or all-browser fetching with `--browser-endpoint`;
+mixed routing is currently a Python composition option. Map and email service
+clients are outside this OpenRent fetch interface.
 
 ```mermaid
 flowchart LR
@@ -33,7 +62,7 @@ stop after five idle minutes; the API remains available to start them again.
 The container itself is not repeatedly created or destroyed, and the application
 does not receive the Docker socket.
 
-All application-initiated OpenRent HTML, summary JSON, and photo requests use real
+In all-browser mode, application-initiated OpenRent HTML, summary JSON, and photo requests use real
 browser navigation, including repeated query parameters and the summary API's
 `X-Requested-With` header. This is deliberately not Playwright's separate
 `APIRequestContext`, and there is no cookie export back into httpx. Map, review,
@@ -132,6 +161,9 @@ transport, including its susceptibility to the current WAF challenge.
 Client policy tests use a fake `FetchTransport`. Browser RPC tests inject an HTTPX
 mock transport through the constructor, covering our challenge replay, pacing,
 cancellation, and alert suppression rules without replacing client attributes.
+Router tests cover selection, forwarding limits, shared pacing, and cleanup.
+HTTP adapter tests cover concurrent callback isolation and bounded decoding;
+existing client tests cover retries, redirect validation, and cancellation.
 These tests exercise application decisions. The opt-in real-browser test is an
 integration check of our worker and deployment wiring, including persistent
 profile configuration and viewer authentication, rather than a unit test of
@@ -159,6 +191,8 @@ photos, and a phone/laptop verification check before relying on resumed emails.
 Implementation entry points:
 
 - `fetch_transport.py`: application-facing transport interface and lifecycle contract.
+- `http_transport.py`: asynchronous HTTP implementation, cookies, and bounded reads.
+- `routing_transport.py`: explicit per-request selection between HTTP and Chromium.
 - `browser_worker.py`: process lifecycle, persistent browser, request serialization,
   challenge detection/waiting, authenticated API.
 - `browser_transport.py`: client polling, reconstructed responses, durable alert

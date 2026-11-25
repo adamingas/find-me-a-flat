@@ -80,7 +80,7 @@ async def test_browser_transport_pauses_replays_and_preserves_binary_response():
         http_transport=httpx.MockTransport(handler),
     )
     async with with_transport(
-        lambda _: pytest.fail("HTTP fallback is forbidden"), browser=browser
+        lambda _: pytest.fail("HTTP fallback is forbidden"), transport=browser
     ) as client:
         content, mime, dimensions, _ = await client.image(
             "https://imagescdn.openrent.co.uk/photo.png"
@@ -196,7 +196,7 @@ async def test_browser_summary_params_and_rate_limit_are_shared_across_workers()
     )
     async with with_transport(
         lambda _: pytest.fail("HTTP fallback is forbidden"),
-        browser=browser,
+        transport=browser,
         concurrency=2,
         requests_per_second=20,
     ) as client:
