@@ -15,6 +15,7 @@ import httpx
 from PIL import Image as PILImage
 from tenacity import retry, retry_if_exception, stop_after_attempt
 
+from .browser_protocol import is_challenge
 from .http_logging import log_http_failure, safe_url
 
 BASE_URL = "https://www.openrent.co.uk"
@@ -97,6 +98,7 @@ class OpenRentClient:
         concurrency: int = 1,
         requests_per_second: float = 0.2,
         cookie_file: Path | None = None,
+        browser=None,
     ):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Timeout must be positive.")
@@ -108,6 +110,7 @@ class OpenRentClient:
         self._rate_lock = asyncio.Lock()
         self._interval = 1 / requests_per_second
         self._next_request_at = 0.0
+        self.browser = browser
         cookies = None
         if cookie_file:
             cookies = http.cookiejar.MozillaCookieJar(str(cookie_file))
@@ -132,7 +135,11 @@ class OpenRentClient:
         return self
 
     async def __aexit__(self, *args):
-        await self.http.__aexit__(*args)
+        try:
+            if self.browser:
+                await self.browser.aclose()
+        finally:
+            await self.http.__aexit__(*args)
 
     async def _on_request(self, request):
         # Count every HTTP attempt, including redirects and retries.
@@ -154,6 +161,11 @@ class OpenRentClient:
 
     @staticmethod
     def _check_access(response):
+        if is_challenge(response.headers):
+            raise FetchError(
+                "OpenRent requires browser verification; configure --browser-endpoint "
+                "and complete verification through its noVNC viewer."
+            )
         if response.status_code in (403, 401):
             log_http_failure(response, "access_refused")
             raise FetchError(
@@ -164,8 +176,15 @@ class OpenRentClient:
     @retry_request
     async def get(self, url, params=None, headers=None) -> httpx.Response:
         self._check_url(url)
-        response = await self.http.get(url, params=params, headers=headers)
+        if self.browser:
+            response = await self.browser.get(
+                url, params=params, headers=headers, before_request=self._on_request
+            )
+        else:
+            response = await self.http.get(url, params=params, headers=headers)
         self._check_access(response)
+        if is_challenge(response.headers, response.content):
+            raise FetchError("OpenRent returned a browser challenge instead of listing data.")
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError:
@@ -213,6 +232,15 @@ class OpenRentClient:
     async def image(self, url):
         """Stream and verify photos, rejecting error pages and oversized downloads."""
         self._check_url(url)
+        if self.browser:
+            response = await self.browser.get(url, before_request=self._on_request)
+            self._check_access(response)
+            response.raise_for_status()
+            content = response.content
+            if len(content) > MAX_IMAGE_BYTES:
+                raise FetchError("Image exceeds the 25 MiB download limit.")
+            mime, dimensions = await asyncio.to_thread(self._verify_image, content, url)
+            return content, mime, dimensions, response.headers
         async with self.http.stream("GET", url) as response:
             self._check_access(response)
             response.raise_for_status()

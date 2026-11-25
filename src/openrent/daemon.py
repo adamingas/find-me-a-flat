@@ -12,6 +12,7 @@ from dbos import DBOS
 
 from . import db as database
 from .amenity_client import AmenityClient
+from .browser_transport import configuration as browser_configuration
 from .client import OpenRentClient
 from .ingestion import (
     DISCOVERY_QUEUE,
@@ -110,6 +111,7 @@ async def run_daemon(args, api, website):
                     concurrency=args.concurrency,
                     requests_per_second=args.requests_per_minute / 60,
                     cookie_file=args.cookie_file,
+                    browser=browser_configuration(args),
                 ) as client,
                 database.connect(args.db) as db,
                 AmenityClient(timeout=max(60, args.timeout)) as amenity_client,

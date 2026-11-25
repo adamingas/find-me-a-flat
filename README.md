@@ -104,6 +104,12 @@ All OpenRent requests share one HTTP client, concurrency bound and rate limiter,
 redirects and retries. Review agents have their own concurrency limit. Omit
 `--criteria-file` to archive without review. See [the filter reference](docs/reference.md).
 
+An optional [browser transport with noVNC handoff](docs/browser-handoff.md) reuses a
+persistent Chromium session when OpenRent requires JavaScript or human verification.
+It starts the browser on demand, pauses for verification, and releases browser memory
+after five idle minutes. Enable it explicitly with `compose.browser.yaml` or
+`--browser-endpoint`; the normal HTTP transport remains the default.
+
 DBOS exposes workflow status and recovery controls. Steps retry failures three times; exhausted failures
 remain visible as DBOS errors and require repair and an explicit DBOS rewind. Interrupted
 workflows recover automatically when the daemon restarts with the same DBOS application version.

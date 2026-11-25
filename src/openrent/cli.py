@@ -122,6 +122,27 @@ def request_flags(command):
             click.option("--concurrency", type=click.IntRange(min=1), default=1, show_default=True),
             click.option("--timeout", type=click.FloatRange(min=0, min_open=True), default=30),
             click.option("--cookie-file", type=click.Path(path_type=Path)),
+            click.option(
+                "--browser-endpoint",
+                envvar="OPENRENT_BROWSER_ENDPOINT",
+                help="Optional browser worker API URL; routes OpenRent requests through Chromium.",
+            ),
+            click.option(
+                "--browser-token-file",
+                envvar="OPENRENT_BROWSER_TOKEN_FILE",
+                type=click.Path(exists=True, dir_okay=False, path_type=Path),
+            ),
+            click.option(
+                "--browser-viewer-url",
+                envvar="OPENRENT_BROWSER_VIEWER_URL",
+                help="Tailnet noVNC link included in browser-attention alerts.",
+            ),
+            click.option(
+                "--browser-alert-to",
+                multiple=True,
+                envvar="OPENRENT_BROWSER_ALERT_TO",
+                help="Send verification alerts to this address (repeatable; opt-in).",
+            ),
             click.option("--quiet", is_flag=True),
         ]
     ):

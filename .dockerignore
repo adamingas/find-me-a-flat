@@ -1,5 +1,6 @@
 **
 !Dockerfile
+!Dockerfile.browser
 !pyproject.toml
 !uv.lock
 !.python-version

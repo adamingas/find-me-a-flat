@@ -1,0 +1,52 @@
+# Opt-in overlay: docker compose -f compose.yaml -f compose.browser.yaml up -d --build
+services:
+  openrent:
+    environment:
+      OPENRENT_BROWSER_ENDPOINT: http://127.0.0.1:8091
+      OPENRENT_BROWSER_TOKEN_FILE: /run/secrets/browser_api_token
+      OPENRENT_BROWSER_VIEWER_URL: ${OPENRENT_BROWSER_VIEWER_URL:?Set the tailnet noVNC URL}
+      OPENRENT_BROWSER_ALERT_TO: ${OPENRENT_BROWSER_ALERT_TO:-}
+    secrets:
+      - browser_api_token
+    depends_on:
+      browser:
+        condition: service_started
+
+  browser:
+    build:
+      context: .
+      dockerfile: Dockerfile.browser
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8091:8091"
+      - "${BROWSER_TAILNET_IP:?Set the server tailnet IPv4 address}:5801:5800"
+    environment:
+      BROWSER_TOKEN_FILE: /run/secrets/browser_api_token
+      VNC_PASSWORD_FILE: /run/secrets/browser_vnc_password
+      BROWSER_IDLE_SECONDS: "300"
+      BROWSER_CHROMIUM_SANDBOX: ${BROWSER_CHROMIUM_SANDBOX:-true}
+    secrets:
+      - browser_api_token
+      - browser_vnc_password
+    volumes:
+      - browser-profile:/state
+    shm_size: 256m
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 1
+    pids_limit: 512
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+secrets:
+  browser_api_token:
+    file: ./secrets/browser-api-token
+  browser_vnc_password:
+    file: ./secrets/browser-vnc-password
+
+volumes:
+  browser-profile:
