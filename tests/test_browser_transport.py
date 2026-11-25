@@ -72,12 +72,12 @@ async def test_browser_transport_pauses_replays_and_preserves_binary_response():
             },
         )
 
-    browser = BrowserTransport("http://localhost:8091", "test-token", notify, poll_seconds=0)
-    await browser.http.aclose()
-    browser.http = httpx.AsyncClient(
-        base_url="http://localhost:8091/",
-        headers={"Authorization": "Bearer test-token"},
-        transport=httpx.MockTransport(handler),
+    browser = BrowserTransport(
+        "http://localhost:8091",
+        "test-token",
+        notify,
+        poll_seconds=0,
+        http_transport=httpx.MockTransport(handler),
     )
     async with with_transport(
         lambda _: pytest.fail("HTTP fallback is forbidden"), browser=browser
@@ -91,25 +91,84 @@ async def test_browser_transport_pauses_replays_and_preserves_binary_response():
 
 
 @pytest.mark.asyncio
+async def test_challenge_replays_are_paced_even_when_notification_fails():
+    events = []
+
+    async def pace(request):
+        events.append("pace")
+
+    async def notify(episode):
+        events.append("notify")
+        raise OSError("Cannot persist alert reservation")
+
+    def handler(request):
+        events.append("fetch")
+        if events.count("fetch") == 1:
+            return httpx.Response(423, json={"episode": "one"})
+        return httpx.Response(
+            200,
+            json={
+                "url": "https://www.openrent.co.uk/search",
+                "status": 200,
+                "headers": {},
+                "body": base64.b64encode(b"Results").decode(),
+            },
+        )
+
+    browser = BrowserTransport(
+        "http://localhost:8091",
+        "token",
+        notify,
+        poll_seconds=0,
+        http_transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await browser.get("https://www.openrent.co.uk/search", before_request=pace)
+        assert result.content == b"Results"
+        assert events == ["pace", "fetch", "notify", "pace", "fetch"]
+    finally:
+        await browser.aclose()
+
+
+@pytest.mark.asyncio
 async def test_cancelling_human_wait_releases_transport_lock():
     notified = asyncio.Event()
+    verified = False
 
     async def notify(_):
         notified.set()
 
-    browser = BrowserTransport("http://localhost:8091", "test-token", notify, poll_seconds=60)
-    await browser.http.aclose()
-    browser.http = httpx.AsyncClient(
-        base_url="http://localhost:8091/",
-        transport=httpx.MockTransport(lambda _: httpx.Response(423, json={"episode": "waiting"})),
+    def handler(request):
+        if not verified:
+            return httpx.Response(423, json={"episode": "waiting"})
+        return httpx.Response(
+            200,
+            json={
+                "url": "https://www.openrent.co.uk/search",
+                "status": 200,
+                "headers": {},
+                "body": base64.b64encode(b"Results").decode(),
+            },
+        )
+
+    browser = BrowserTransport(
+        "http://localhost:8091",
+        "test-token",
+        notify,
+        poll_seconds=60,
+        http_transport=httpx.MockTransport(handler),
     )
     task = asyncio.create_task(browser.get("https://www.openrent.co.uk/search"))
     await asyncio.wait_for(notified.wait(), 1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert not browser._lock.locked()
-    await browser.aclose()
+    verified = True
+    try:
+        response = await asyncio.wait_for(browser.get("https://www.openrent.co.uk/search"), 1)
+        assert response.content == b"Results"
+    finally:
+        await browser.aclose()
 
 
 @pytest.mark.asyncio
@@ -132,10 +191,8 @@ async def test_browser_summary_params_and_rate_limit_are_shared_across_workers()
             },
         )
 
-    browser = BrowserTransport("http://localhost:8091", "token", None)
-    await browser.http.aclose()
-    browser.http = httpx.AsyncClient(
-        base_url="http://localhost:8091/", transport=httpx.MockTransport(handler)
+    browser = BrowserTransport(
+        "http://localhost:8091", "token", None, http_transport=httpx.MockTransport(handler)
     )
     async with with_transport(
         lambda _: pytest.fail("HTTP fallback is forbidden"),

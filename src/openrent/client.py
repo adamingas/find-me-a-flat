@@ -16,6 +16,7 @@ from PIL import Image as PILImage
 from tenacity import retry, retry_if_exception, stop_after_attempt
 
 from .browser_protocol import is_challenge
+from .fetch_transport import FetchTransport
 from .http_logging import log_http_failure, safe_url
 
 BASE_URL = "https://www.openrent.co.uk"
@@ -98,7 +99,9 @@ class OpenRentClient:
         concurrency: int = 1,
         requests_per_second: float = 0.2,
         cookie_file: Path | None = None,
-        browser=None,
+        browser: FetchTransport | None = None,
+        *,
+        http_transport: httpx.AsyncBaseTransport | None = None,
     ):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Timeout must be positive.")
@@ -119,6 +122,7 @@ class OpenRentClient:
             except (OSError, http.cookiejar.LoadError) as exc:
                 raise FetchError(f"Cannot read Netscape cookie file: {exc}") from exc
         self.http = httpx.AsyncClient(
+            transport=http_transport,
             follow_redirects=True,
             timeout=timeout,
             cookies=cookies,

@@ -15,6 +15,7 @@ import httpx
 
 from .browser_protocol import MAX_BODY_BYTES, allowed_url
 from .email_sender import EmailSendError, ResendEmailConfig, ResendEmailSender, validate_recipient
+from .fetch_transport import BeforeRequest, FetchTransport, QueryParams, RequestHeaders
 from .settings import load_settings
 
 logger = logging.getLogger(__name__)
@@ -77,22 +78,39 @@ class ChallengeNotifier:
                 )
 
 
-class BrowserTransport:
-    def __init__(self, endpoint, token, notify, *, poll_seconds=10, timeout=90):
+class BrowserTransport(FetchTransport):
+    def __init__(
+        self,
+        endpoint,
+        token,
+        notify,
+        *,
+        poll_seconds=10,
+        timeout=90,
+        http_transport: httpx.AsyncBaseTransport | None = None,
+    ):
         self.notify = notify
         self.poll_seconds = poll_seconds
         self._lock = asyncio.Lock()
         self.http = httpx.AsyncClient(
+            transport=http_transport,
             base_url=endpoint.rstrip("/") + "/",
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout,
             trust_env=False,
         )
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         await self.http.aclose()
 
-    async def get(self, url, *, params=None, headers=None, before_request=None):
+    async def get(
+        self,
+        url: str,
+        *,
+        params: QueryParams | None = None,
+        headers: RequestHeaders | None = None,
+        before_request: BeforeRequest | None = None,
+    ) -> httpx.Response:
         request = httpx.Request("GET", url, params=params, headers=headers)
         async with self._lock:
             while True:

@@ -15,20 +15,7 @@ from openrent.client import FetchError, OpenRentClient
 @asynccontextmanager
 async def with_transport(handler, **kwargs):
     kwargs.setdefault("requests_per_second", 1_000_000)
-    client = OpenRentClient(**kwargs)
-    headers, cookies, event_hooks = (
-        client.http.headers,
-        client.http.cookies,
-        client.http.event_hooks,
-    )
-    await client.http.aclose()
-    client.http = httpx.AsyncClient(
-        transport=httpx.MockTransport(handler),
-        follow_redirects=True,
-        headers=headers,
-        cookies=cookies,
-        event_hooks=event_hooks,
-    )
+    client = OpenRentClient(http_transport=httpx.MockTransport(handler), **kwargs)
     async with client:
         yield client
 

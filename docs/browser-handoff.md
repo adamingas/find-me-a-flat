@@ -7,6 +7,12 @@ separate browser did not unlock the application's HTTP client on paralimni.
 
 ## Design
 
+`OpenRentClient` accepts the `FetchTransport` protocol through its constructor.
+The protocol defines buffered `get`, per-attempt pacing, cancellation, and close
+semantics. `BrowserTransport` implements it in a separate module; Playwright stays
+inside the worker container. No runtime methods or library globals are patched.
+The client continues to own response validation, parsing, and image checks.
+
 ```mermaid
 flowchart LR
     A[OpenRent workflows] -->|Authenticated API, host loopback| B[Browser worker]
@@ -123,6 +129,14 @@ transport, including its susceptibility to the current WAF challenge.
 
 ## Validation and rollout
 
+Client policy tests use a fake `FetchTransport`. Browser RPC tests inject an HTTPX
+mock transport through the constructor, covering our challenge replay, pacing,
+cancellation, and alert suppression rules without replacing client attributes.
+These tests exercise application decisions. The opt-in real-browser test is an
+integration check of our worker and deployment wiring, including persistent
+profile configuration and viewer authentication, rather than a unit test of
+Chromium or Playwright internals.
+
 ```sh
 uv sync --extra browser
 uv run --extra browser pytest
@@ -144,6 +158,7 @@ photos, and a phone/laptop verification check before relying on resumed emails.
 
 Implementation entry points:
 
+- `fetch_transport.py`: application-facing transport interface and lifecycle contract.
 - `browser_worker.py`: process lifecycle, persistent browser, request serialization,
   challenge detection/waiting, authenticated API.
 - `browser_transport.py`: client polling, reconstructed responses, durable alert
