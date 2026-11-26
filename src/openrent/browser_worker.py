@@ -23,7 +23,7 @@ from .browser_protocol import MAX_BODY_BYTES, allowed_url, is_challenge
 from .http_logging import safe_error, safe_url
 from .logging_setup import configure_logging
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("openrent.browser_worker")
 
 
 @dataclass
