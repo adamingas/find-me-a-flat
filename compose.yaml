@@ -48,6 +48,8 @@ services:
       VNC_PASSWORD_FILE: /run/secrets/browser_vnc_password
       BROWSER_IDLE_SECONDS: "300"
       BROWSER_CHROMIUM_SANDBOX: ${BROWSER_CHROMIUM_SANDBOX:-true}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-${OPENROUTER_TOKEN:-}}
+      BROWSER_CAPTCHA_MODEL: ${BROWSER_CAPTCHA_MODEL:-google/gemini-3.8-flash}
     secrets:
       - browser_api_token
       - browser_vnc_password

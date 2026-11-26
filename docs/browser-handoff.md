@@ -89,11 +89,15 @@ the HTTP photo path, this is not a streaming network-download limit.
 1. AWS's `x-amzn-waf-action` header or recognized challenge HTML identifies a
    challenge. A missing `PROPERTYIDS` alone does **not** imply a CAPTCHA.
 2. Allow 15 seconds for JavaScript verification to finish automatically.
-3. If it persists, return `423` with an episode identifier. Keep the browser open,
+3. If it persists, try the AWS CAPTCHA solver once, with a maximum 30-second
+   budget inside the request deadline. Gemini selects the puzzle images through
+   OpenRouter; the worker redeems AWS's voucher in the existing browser context.
+   Reload the requested document and check that verification actually cleared.
+4. If solving fails or the document is still blocked, return `423` with an episode identifier. Keep the browser open,
    exempt it from idle shutdown, and stop new navigations.
-4. The application logs the viewer link and emails the configured recipients.
+5. The application logs the viewer link and emails the configured recipients.
    Poll the worker every ten seconds without refreshing the challenge.
-5. After the user completes verification and the browser receives a normal
+6. After the user completes verification and the browser receives a normal
    OpenRent document, replay the original request in that session. Only that
    response goes to the application. Navigating to an unrelated page is not proof
    that the pending request succeeded.
@@ -108,11 +112,26 @@ does not automatically rewind failures from the previous implementation/version.
 The profile volume preserves cookies and local storage across idle shutdown and
 container replacement. Session expiry can still require another verification.
 A worker crash loses the live page, so the next request reopens the target with the
-saved profile. There is no automatic CAPTCHA solver.
+saved profile. Failed automatic attempts are not repeated by human-wait polling.
+
+The worker composes a `CaptchaSolver` with a separate Gemini image selector.
+`vendor/awswaf` packages upstream commit `0b7d9eb673daa50577453926576e0c9274f9dc75`
+with its MIT license. Upstream Python handles silent challenges only; the visual
+CAPTCHA protocol is an async Python adaptation of its Go implementation. Chromium
+supplies the existing silent-challenge token, avoiding upstream's blocking proof
+of work and unsupported challenge types. AWS protocol requests use the browser's
+request context; property HTML, JSON and photos still use browser navigation.
+
+The selector uses the same `OpenRouterConfig`, asynchronous Agents SDK Responses
+client, strict structured output, and disabled tracing as property reviews. It
+sends only puzzle images and the target instruction, with no tools. Model output
+must contain unique, in-range integer image indices. Logs record episode, model,
+token usage and outcome, without cookies, vouchers, credentials or model output.
 
 Alert attempts are reserved on disk beside the application database before calling
 Resend. The same episode is not re-emailed after restart, and different episodes
-have a one-hour alert cooldown. Uncertain delivery is not retried automatically;
+have a one-hour alert cooldown. A different episode still pending after the
+cooldown gets its deferred alert. Uncertain delivery is not retried automatically;
 the log link remains available. These alerts are separate from property digests
 and require `--browser-alert-to`; existing digest recipients are not implicitly
 subscribed. Application startup requires an alert recipient and Resend credentials
@@ -122,6 +141,31 @@ wires a notifier callback into its browser transport. No password or API token i
 put in an email link.
 
 ## Deployment
+
+### Automatic solver validation — 26 November 2026
+
+Branch `codex/awswaf-gemini-solver` was tested locally with Chromium and model
+traffic routed through an SSH SOCKS tunnel on paralimni. Production was not modified.
+The unmodified upstream Python silent solver failed on OpenRent's unsupported
+challenge type (`TypeError: 'str' object is not callable`); this is why the worker
+uses Chromium's silent token and the async port of upstream's visual CAPTCHA flow.
+
+A real nine-image challenge was solved with `google/gemini-3.8-flash` through
+OpenRouter: 9,919 input tokens, 156 output tokens, approximately 13 seconds from
+solve start to resumed HTTP 200. No human interaction was needed. After restarting
+the local browser, the normal application fetch path returned 10,470 search
+candidates, one summary, a property detail response, and a validated 1439×960 WebP
+photo (52,432 bytes). This demonstrates one successful solve and session reuse,
+not a measured long-term success rate.
+
+Validation: full suite 298 passed / 1 opt-in browser test skipped; the final
+solver-focused suite (including an added timeout case) passed 17 tests, and the
+real-browser suite passed both tests separately. Ruff, dependency wheel, application
+wheel and source distribution checks passed. The source distribution includes the
+local dependency. A Docker image build could not run because this development
+machine denies Docker daemon access; no image was published from this branch.
+
+### Configuration
 
 The `Dockerfile` and GitHub workflow build and publish **one image** containing the
 application and browser dependencies. `compose.yaml` runs that image in
@@ -154,7 +198,9 @@ export OPENRENT_BROWSER_ALERT_TO='your-address@example.com'
 # paralimni currently blocks Chromium's internal user-namespace sandbox.
 # On hosts that support it, omit this and keep the default true.
 export BROWSER_CHROMIUM_SANDBOX=false
-# Export the existing RESEND_TOKEN and review credentials as usual.
+# Export RESEND_TOKEN and OPENROUTER_API_KEY (or OPENROUTER_TOKEN) as usual.
+# The same OpenRouter credential is used for property reviews and CAPTCHA solving.
+export BROWSER_CAPTCHA_MODEL=google/gemini-3.8-flash
 
 docker compose --env-file /dev/null config --quiet
 docker compose --env-file /dev/null pull openrent browser
@@ -165,12 +211,13 @@ For local development, build the shared image with `docker compose --env-file /d
 before starting both services. The application waits for the worker's authenticated `/status` healthcheck;
 checking health does not start Chromium, so an idle worker remains inexpensive.
 The existing `RESEND_TOKEN` is passed to the application only. The worker receives
-neither email credentials nor application database access.
+the shared OpenRouter credential, but no email credentials or application database access.
 
 For a local test through another machine's network, set `BROWSER_PROXY` on the
 worker to an HTTP or SOCKS proxy, for example `socks5://127.0.0.1:18080` for an SSH
 dynamic forwarding tunnel. Chromium routes its page and challenge traffic through
-that proxy. The application's email and model clients use their own proxy settings.
+that proxy. Model clients use their own HTTP(S)_PROXY settings; SOCKS proxy testing
+also requires the `socksio` package in the test environment.
 
 Worker logs include browser startup and shutdown, challenge episode IDs, and the
 request resumed after verification. Application logs record alert acceptance by

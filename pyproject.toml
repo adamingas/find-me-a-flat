@@ -22,7 +22,10 @@ dependencies = [
 openrent = "openrent.cli:main"
 
 [project.optional-dependencies]
-browser = ["aiohttp>=3.13,<4", "playwright==1.64.1"]
+browser = ["aiohttp>=3.13,<4", "playwright==1.64.1", "awswaf"]
+
+[tool.uv.sources]
+awswaf = { path = "vendor/awswaf" }
 
 [build-system]
 requires = ["hatchling"]
@@ -42,3 +45,4 @@ dev = [
 
 [tool.ruff]
 line-length = 100
+extend-exclude = ["vendor"]

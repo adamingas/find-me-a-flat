@@ -1,0 +1,13 @@
+[project]
+name = "awswaf"
+version = "0.0.0+0b7d9eb.1"
+requires-python = ">=3.12"
+dependencies = ["curl-cffi>=0.14,<1", "cryptography>=46", "pyscrypt>=1.6,<2"]
+license = "MIT"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["awswaf"]

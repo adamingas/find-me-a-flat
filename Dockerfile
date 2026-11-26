@@ -12,6 +12,7 @@ ENV UV_NO_SYNC=true \
 WORKDIR /app
 
 COPY pyproject.toml uv.lock .python-version ./
+COPY vendor ./vendor
 RUN uv sync --locked --no-dev --extra browser --no-install-project
 COPY src ./src
 COPY schedule.sh criteria.txt ./

@@ -1,7 +1,8 @@
 """One lazily started, persistent Chromium session shared with a noVNC viewer.
 
 The worker owns its own child processes. It never needs the Docker socket or
-access to the application's archive, email credentials, or review credentials.
+access to the application's archive or email credentials. Its CAPTCHA solver uses
+the shared OpenRouter credential through an injected interface.
 """
 
 import asyncio
@@ -20,6 +21,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
 from .browser_protocol import MAX_BODY_BYTES, allowed_url, is_challenge
+from .captcha_solver import CaptchaSolver
 from .http_logging import safe_error, safe_url
 from .logging_setup import configure_logging
 
@@ -45,8 +47,10 @@ class BrowserConfig:
 
 
 class BrowserWorker:
-    def __init__(self, config):
+    def __init__(self, config, solver: CaptchaSolver | None = None):
         self.config = config
+        self.solver = solver
+        self._attempted_episode = None
         self.lock = asyncio.Lock()
         self.context = None
         self.page = None
@@ -239,6 +243,29 @@ class BrowserWorker:
     def _blocked(snapshot):
         return snapshot is None or is_challenge(snapshot["headers"], snapshot["body"])
 
+    async def _try_solver(self, snapshot, deadline):
+        if self.solver is None or self._attempted_episode == self.episode:
+            return False
+        self._attempted_episode = self.episode
+        remaining = deadline - asyncio.get_running_loop().time() - 5
+        if remaining <= 0:
+            return False
+        logger.info("Automatic CAPTCHA solve started; episode=%s", self.episode)
+        try:
+            async with asyncio.timeout(min(30, remaining)):
+                await self.solver.solve(self.page, snapshot)
+            await self.page.reload(wait_until="domcontentloaded", timeout=5000)
+            return True
+        except Exception as exc:  # noqa: BLE001 - solver boundary must preserve human handoff
+            # Third-party failures must preserve the human handoff. Exception bodies
+            # can contain model responses or AWS tokens, so log only their type.
+            logger.warning(
+                "Automatic CAPTCHA solve failed; episode=%s error=%s; handing off to human.",
+                self.episode,
+                type(exc).__name__,
+            )
+            return False
+
     async def fetch(self, url, headers=None):
         if not allowed_url(url):
             raise ValueError("Only OpenRent HTTPS URLs are allowed")
@@ -248,7 +275,7 @@ class BrowserWorker:
         async with self.lock:
             self.last_used = time.monotonic()
             try:
-                async with asyncio.timeout(self.config.request_timeout):
+                async with asyncio.timeout(self.config.request_timeout) as request_deadline:
                     await self._ensure_browser()
                     # Polling must never reload a CAPTCHA during human interaction.
                     # Replay the requested URL after the challenge clears.
@@ -280,6 +307,8 @@ class BrowserWorker:
                             if snapshot is None:
                                 raise RuntimeError("Browser did not produce a readable response")
                             self.episode = self.episode or str(uuid4())
+                            if await self._try_solver(snapshot, request_deadline.when()):
+                                continue
                             logger.warning(
                                 "Browser waiting for human verification; episode=%s url=%s",
                                 self.episode,
@@ -345,6 +374,8 @@ def application(worker, token):
 
 
 def main():
+    from .captcha_solver import configuration
+
     configure_logging()
     token = Path(os.environ["BROWSER_TOKEN_FILE"]).read_text().strip()
     if len(token) < 32 or any(c.isspace() for c in token):
@@ -356,7 +387,8 @@ def main():
             idle_seconds=float(os.environ.get("BROWSER_IDLE_SECONDS", "300")),
             sandbox=os.environ.get("BROWSER_CHROMIUM_SANDBOX", "true").lower() != "false",
             proxy=os.environ.get("BROWSER_PROXY"),
-        )
+        ),
+        solver=configuration(os.environ),
     )
     web.run_app(application(worker, token), host="0.0.0.0", port=8091, access_log=None)
 

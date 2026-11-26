@@ -7,5 +7,7 @@
 !criteria.txt
 !src/
 !src/**
+!vendor/
+!vendor/**
 **/__pycache__/
 **/*.pyc
