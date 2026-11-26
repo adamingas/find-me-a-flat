@@ -106,3 +106,29 @@ async def test_alert_reservation_survives_restart_and_unknown_delivery(tmp_path)
     assert "Open browser</a>" in calls[0][0][2]
     assert json.loads(path.read_text())["episode"] == "first"
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_new_challenge_is_not_lost_during_cooldown(tmp_path, monkeypatch):
+    now, messages = [10000], []
+    monkeypatch.setattr("openrent.browser_notifications.time.time", lambda: now[0])
+
+    class Sender:
+        async def send(self, *args, **kwargs):
+            messages.append(kwargs["idempotency_key"])
+
+    path = tmp_path / "alerts.json"
+    notifier = ChallengeNotifier(path, "http://tailnet", ("me@example.com",), Sender())
+    await notifier("first")
+    # Restarting retains the cooldown, but must not permanently silence a new challenge.
+    notifier = ChallengeNotifier(path, "http://tailnet", ("me@example.com",), Sender())
+    await notifier("second")
+    now[0] += 3599
+    await notifier("second")
+    assert len(messages) == 1
+    now[0] += 1
+    await notifier("second")
+    await notifier("second")
+    assert len(messages) == 2
+    assert messages[0] != messages[1]
+    assert json.loads(path.read_text())["episode"] == "second"

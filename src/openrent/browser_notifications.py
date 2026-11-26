@@ -24,9 +24,13 @@ class ChallengeNotifier:
         self.sender = sender
         self.cooldown = cooldown
         self._seen = None
+        self._retry_after = 0
 
     async def __call__(self, episode):
         if episode == self._seen:
+            return
+        now = time.time()
+        if now < self._retry_after:
             return
         logger.warning(
             "OpenRent needs browser attention; episode=%s. Open %s", episode, self.viewer_url
@@ -35,13 +39,13 @@ class ChallengeNotifier:
             previous = json.loads(self.path.read_text())
         except FileNotFoundError:
             previous = {}
-        now = time.time()
-        if (
-            previous.get("episode") == episode
-            or now - previous.get("attempted_at", 0) < self.cooldown
-        ):
+        if previous.get("episode") == episode:
             logger.info("Browser alert suppressed by durable reservation; episode=%s", episode)
             self._seen = episode
+            return
+        self._retry_after = previous.get("attempted_at", 0) + self.cooldown
+        if now < self._retry_after:
+            logger.info("Browser alert deferred until cooldown expires; episode=%s", episode)
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
