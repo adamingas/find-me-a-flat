@@ -167,6 +167,16 @@ checking health does not start Chromium, so an idle worker remains inexpensive.
 The existing `RESEND_TOKEN` is passed to the application only. The worker receives
 neither email credentials nor application database access.
 
+For a local test through another machine's network, set `BROWSER_PROXY` on the
+worker to an HTTP or SOCKS proxy, for example `socks5://127.0.0.1:18080` for an SSH
+dynamic forwarding tunnel. Chromium routes its page and challenge traffic through
+that proxy. The application's email and model clients use their own proxy settings.
+
+Worker logs include browser startup and shutdown, challenge episode IDs, and the
+request resumed after verification. Application logs record alert acceptance by
+the email provider, duplicate suppression, and delivery failures. Worker failures
+include bounded, redacted diagnostics; display and viewer errors reach stderr.
+
 To check the deployment afterward:
 
 ```sh

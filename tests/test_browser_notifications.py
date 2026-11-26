@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 
 import httpx
 import pytest
@@ -10,7 +11,8 @@ from openrent.email_sender import EmailSendIndeterminate
 
 
 @pytest.mark.asyncio
-async def test_challenge_emails_viewer_link_once_then_resumes_original_request(tmp_path):
+async def test_challenge_emails_viewer_link_once_then_resumes_original_request(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="openrent.browser_notifications")
     messages, requests = [], []
     viewer_url = "http://tailnet:5801/vnc.html?autoconnect=1&resize=remote"
 
@@ -55,6 +57,9 @@ async def test_challenge_emails_viewer_link_once_then_resumes_original_request(t
         assert 'href="http://tailnet:5801/vnc.html?autoconnect=1&amp;resize=remote"' in html
         assert "private-api-token" not in html + text
         assert options["idempotency_key"].startswith("browser-")
+        assert caplog.text.count("Browser alert accepted by email provider") == 1
+        assert "episode=captcha-one recipient=me@example.com" in caplog.text
+        assert "private-api-token" not in caplog.text
     finally:
         await transport.aclose()
 

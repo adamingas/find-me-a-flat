@@ -20,6 +20,8 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
 from .browser_protocol import MAX_BODY_BYTES, allowed_url, is_challenge
+from .http_logging import safe_error, safe_url
+from .logging_setup import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,7 @@ class BrowserConfig:
     sandbox: bool = True
     # Headless operation is only used by offline integration tests.
     desktop: bool = True
+    proxy: str | None = None
 
     def __post_init__(self):
         for value in (self.idle_seconds, self.settle_seconds, self.request_timeout):
@@ -72,12 +75,15 @@ class BrowserWorker:
             async with self.lock:
                 # A pending human challenge is deliberately exempt from idle shutdown.
                 if (
-                    not self.episode
+                    self.context
+                    and not self.episode
                     and time.monotonic() - self.last_used >= self.config.idle_seconds
                 ):
+                    logger.info("Chromium idle timeout reached; stopping browser and viewer.")
                     await self._stop_browser()
 
     async def _stop_browser(self):
+        was_running = self.context is not None or bool(self.processes)
         try:
             if self.context:
                 with contextlib.suppress(PlaywrightError, TimeoutError):
@@ -96,6 +102,8 @@ class BrowserWorker:
                         process.kill()
                         await process.wait()
             self.processes.clear()
+            if was_running:
+                logger.info("Chromium and viewer stopped; persistent profile retained.")
 
     async def _start_desktop(self):
         password = self.config.vnc_password_file.read_bytes().strip()
@@ -129,7 +137,6 @@ class BrowserWorker:
                 "-nolisten",
                 "tcp",
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
             )
         )
         for _ in range(100):
@@ -147,7 +154,6 @@ class BrowserWorker:
                 "0.0.0.0:5800",
                 "127.0.0.1:5900",
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
             )
         )
 
@@ -165,6 +171,7 @@ class BrowserWorker:
                 str(self.config.profile),
                 headless=not self.config.desktop,
                 chromium_sandbox=self.config.sandbox,
+                proxy={"server": self.config.proxy} if self.config.proxy else None,
                 env={**os.environ, "DISPLAY": ":99"},
                 viewport={"width": 1280, "height": 900},
                 accept_downloads=False,
@@ -260,6 +267,13 @@ class BrowserWorker:
                     while True:
                         snapshot = await self._snapshot()
                         if not self._blocked(snapshot):
+                            if self.episode:
+                                logger.info(
+                                    "Browser verification cleared; request resumed; episode=%s url=%s status=%s",
+                                    self.episode,
+                                    safe_url(url),
+                                    snapshot["status"],
+                                )
                             self.episode = None
                             return snapshot
                         if time.monotonic() >= deadline:
@@ -267,7 +281,9 @@ class BrowserWorker:
                                 raise RuntimeError("Browser did not produce a readable response")
                             self.episode = self.episode or str(uuid4())
                             logger.warning(
-                                "Browser waiting for human verification; episode=%s", self.episode
+                                "Browser waiting for human verification; episode=%s url=%s",
+                                self.episode,
+                                safe_url(url),
                             )
                             return {"episode": self.episode}
                         await asyncio.sleep(0.5)
@@ -298,7 +314,9 @@ def application(worker, token):
         except (ValueError, KeyError, TypeError):
             return web.json_response({"error": "Invalid request or oversized response"}, status=400)
         except (PlaywrightError, TimeoutError, OSError, RuntimeError) as exc:
-            logger.error("Browser operation failed: %s", type(exc).__name__)
+            logger.error(
+                "Browser operation failed: %s detail=%s", type(exc).__name__, safe_error(exc)
+            )
             return web.json_response(
                 {"error": "Browser unavailable; inspect worker logs"}, status=503
             )
@@ -327,7 +345,7 @@ def application(worker, token):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO)
+    configure_logging()
     token = Path(os.environ["BROWSER_TOKEN_FILE"]).read_text().strip()
     if len(token) < 32 or any(c.isspace() for c in token):
         raise ValueError("Browser token must have at least 32 non-whitespace characters")
@@ -337,6 +355,7 @@ def main():
             vnc_password_file=Path(os.environ["VNC_PASSWORD_FILE"]),
             idle_seconds=float(os.environ.get("BROWSER_IDLE_SECONDS", "300")),
             sandbox=os.environ.get("BROWSER_CHROMIUM_SANDBOX", "true").lower() != "false",
+            proxy=os.environ.get("BROWSER_PROXY"),
         )
     )
     web.run_app(application(worker, token), host="0.0.0.0", port=8091, access_log=None)

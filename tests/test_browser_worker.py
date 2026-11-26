@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 
 import pytest
@@ -17,7 +18,7 @@ from openrent.browser_worker import BrowserConfig, BrowserWorker, application
 
 
 @pytest.mark.asyncio
-async def test_worker_api_requires_auth_and_preserves_upstream_status():
+async def test_worker_api_requires_auth_and_preserves_upstream_status(caplog):
     class Worker:
         context = episode = None
 
@@ -28,6 +29,8 @@ async def test_worker_api_requires_auth_and_preserves_upstream_status():
             pass
 
         async def fetch(self, url, headers):
+            if url.endswith("/failure"):
+                raise RuntimeError("Cannot start display; token=private-token")
             if url.endswith("/challenge"):
                 return {"episode": "one"}
             return {"url": url, "status": 429, "headers": {"retry-after": "30"}, "body": b"Wait"}
@@ -55,6 +58,12 @@ async def test_worker_api_requires_auth_and_preserves_upstream_status():
             assert response.status == 200
             assert (await response.json())["status"] == 429
             assert (await response.json())["headers"]["retry-after"] == "30"
+            response = await client.post(
+                "/fetch", json={"url": "https://www.openrent.co.uk/failure"}
+            )
+            assert response.status == 503
+            assert "Cannot start display" in caplog.text
+            assert "private-token" not in caplog.text
     finally:
         await runner.cleanup()
 
@@ -63,7 +72,8 @@ async def test_worker_api_requires_auth_and_preserves_upstream_status():
     os.environ.get("OPENRENT_BROWSER_TESTS") != "1", reason="requires installed Chromium"
 )
 @pytest.mark.asyncio
-async def test_real_browser_handoff_persistence_idle_shutdown_and_json(tmp_path):
+async def test_real_browser_handoff_persistence_idle_shutdown_and_json(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="openrent.browser_worker")
     navigations = []
     photo = base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6XcAAAAASUVORK5CYII="
@@ -181,6 +191,9 @@ async def test_real_browser_handoff_persistence_idle_shutdown_and_json(tmp_path)
                 break
             await asyncio.sleep(0.05)
         assert worker.context is None
+        assert "Browser verification cleared; request resumed" in caplog.text
+        assert "episode=" + first["episode"] in caplog.text
+        assert "Chromium idle timeout reached" in caplog.text
         result = await worker.fetch("https://www.openrent.co.uk/search")
         assert result["status"] == 200  # Profile cookie survived browser shutdown.
     finally:

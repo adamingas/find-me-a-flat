@@ -31,6 +31,14 @@ def safe_url(url):
     return urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path, query, ""))
 
 
+def safe_error(error):
+    """Keep actionable browser diagnostics without credentials or unbounded output."""
+    text = re.sub(r"(?:https?|socks5)://[^\s<>\"']+", lambda m: safe_url(m[0]), str(error))
+    text = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", text)
+    text = _ASSIGNMENT.sub(lambda m: m[1] + '"[REDACTED]"', text)
+    return text[:BODY_LIMIT]
+
+
 def _headers(headers):
     return {
         name: "[REDACTED]"

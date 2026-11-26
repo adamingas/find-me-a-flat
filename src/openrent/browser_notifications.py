@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from .email_sender import EmailSendError
+from .http_logging import safe_error
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,9 @@ class ChallengeNotifier:
     async def __call__(self, episode):
         if episode == self._seen:
             return
-        logger.warning("OpenRent needs browser attention. Open %s", self.viewer_url)
+        logger.warning(
+            "OpenRent needs browser attention; episode=%s. Open %s", episode, self.viewer_url
+        )
         try:
             previous = json.loads(self.path.read_text())
         except FileNotFoundError:
@@ -37,6 +40,7 @@ class ChallengeNotifier:
             previous.get("episode") == episode
             or now - previous.get("attempted_at", 0) < self.cooldown
         ):
+            logger.info("Browser alert suppressed by durable reservation; episode=%s", episode)
             self._seen = episode
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,8 +66,17 @@ class ChallengeNotifier:
                     text,
                     idempotency_key=f"browser-{key}",
                 )
+                logger.info(
+                    "Browser alert accepted by email provider; episode=%s recipient=%s",
+                    episode,
+                    recipient,
+                )
             except EmailSendError as exc:
                 # The reservation remains for explicit rejection AND uncertain acceptance.
                 logger.error(
-                    "Browser alert delivery failed (%s); see viewer link above.", type(exc).__name__
+                    "Browser alert delivery failed; episode=%s recipient=%s error=%s detail=%s",
+                    episode,
+                    recipient,
+                    type(exc).__name__,
+                    safe_error(exc),
                 )
