@@ -236,9 +236,23 @@ The browser integration test renders a local simulated verification page, verifi
 that polling does not navigate away, completes the simulated interaction, checks
 JSON and photo requests, lets the browser shut down, and verifies that its cookie
 survives the next launch. Desktop mode also tests the noVNC WebSocket and VNC
-password authentication. This does not establish that OpenRent will accept an automated
-browser in every session. A rollout still needs one real search, one property with
-photos, and a phone/laptop verification check before relying on resumed emails.
+password authentication.
+
+On 26 November 2026, a local worker and application transport were tested against
+OpenRent through an SSH SOCKS tunnel over the tailnet to paralimni. A real challenge
+paused fetching and triggered one email, which the recipient confirmed receiving.
+The recipient completed verification through noVNC; the pending search resumed
+automatically with HTTP 200. Subsequent requests in that session parsed summary
+JSON and a property with 25 gallery entries, then downloaded and validated a
+1439 × 960 WebP photo. The test script initially skipped summary enrichment and
+used an incorrect detail URL; rerunning with the application's enrichment step
+completed the remaining checks. An actual OpenRouter model request through the
+same tunnel also completed successfully. The production deployment was unchanged.
+
+The same revision passed 281 automated tests, with the desktop integration test
+run separately and passing with Chromium and noVNC enabled. This live check covers
+the browser handoff and fetching path; it does not run the scheduled DBOS workflow,
+property review, or digest delivery end to end.
 
 Implementation entry points:
 
