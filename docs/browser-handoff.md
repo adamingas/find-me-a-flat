@@ -132,8 +132,8 @@ The existing manual `chromium-viewer` container and its profile are separate.
 Use one worker and one application for each profile; do not mount a Chromium
 profile into two live browsers.
 
-After merging into `main`, publish its image using the **Publish container** workflow,
-then copy `compose.yaml` to the server. Publishing is restricted to `main`. The server
+Merging into `main` starts the **Publish container** workflow. After it succeeds,
+copy `compose.yaml` to the server. Publishing is restricted to `main`. The server
 pulls the image as before; it does not need a source checkout or a second build.
 
 On the deployment host, create secrets as the ordinary deployment user (the worker

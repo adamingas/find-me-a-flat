@@ -173,8 +173,8 @@ map requests may fail until they are ready.
 
 ### Publish and pull
 
-Merge changes into `main`, then run the **Publish container** workflow from Actions
-on `main`. Publishing is restricted to that branch.
+The **Publish container** workflow runs on pushes to `main`. It can also be started
+manually from Actions on `main`. Publishing is restricted to that branch.
 It builds Linux amd64 and arm64 images and pushes them to
 `ghcr.io/adamingas/find-me-a-flat:latest`, plus a tag for the commit.
 For a private package, authenticate the server to GHCR with an account/token that
