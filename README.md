@@ -148,7 +148,7 @@ scheduled email notifications run together. The `browser` container runs the wor
 from the same image. Overpass and Valhalla remain separate Compose services.
 The browser worker attempts AWS CAPTCHAs with Gemini through the existing OpenRouter
 credential, then falls back to the email/noVNC handoff if verification does not clear.
-`BROWSER_CAPTCHA_MODEL` defaults to `google/gemini-3.8-flash`.
+`BROWSER_CAPTCHA_MODEL` defaults to `google/gemini-3.1-flash-lite`, using low image detail.
 Host networking preserves the application's existing localhost map URLs.
 
 Export `OPENROUTER_API_KEY` (or `OPENROUTER_TOKEN`) and `RESEND_TOKEN` in your shell,

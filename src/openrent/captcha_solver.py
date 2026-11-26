@@ -62,7 +62,7 @@ class GeminiImageSelector:
                     {
                         "type": "input_image",
                         "image_url": f"data:image/jpeg;base64,{image}",
-                        "detail": "high",
+                        "detail": "low",
                     },
                 ]
             )
@@ -171,7 +171,7 @@ def configuration(environ):
     if not settings.openrouter_api_key.strip():
         raise ValueError("Set OPENROUTER_API_KEY or OPENROUTER_TOKEN for CAPTCHA solving.")
     config = OpenRouterConfig(
-        environ.get("BROWSER_CAPTCHA_MODEL", "google/gemini-3.8-flash"),
+        environ.get("BROWSER_CAPTCHA_MODEL", "google/gemini-3.1-flash-lite"),
         settings.openrouter_api_key,
         environ.get("BROWSER_CAPTCHA_PROVIDER") or None,
     )

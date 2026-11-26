@@ -165,6 +165,41 @@ wheel and source distribution checks passed. The source distribution includes th
 local dependency. A Docker image build could not run because this development
 machine denies Docker daemon access; no image was published from this branch.
 
+### Model and image-detail experiments — 26 November 2026
+
+Three fresh nine-image challenges were solved using the current Gemini 3.8 Flash
+high-detail setting. AWS accepted each selection and the original OpenRent request
+resumed with HTTP 200. Each challenge contained 100×100-pixel JPEG tiles.
+The same images and question were then replayed through five alternative settings,
+with the existing prompt, structured output schema, and 1,024-output-token limit.
+Every alternative matched the complete AWS-accepted selection on all three samples.
+
+The following are means over those three matched samples. Costs are OpenRouter's
+reported `usage.cost`, including output/reasoning tokens, rather than price estimates.
+Latency measures the model call, excluding browser startup and the AWS exchange.
+
+| Model | Detail | Input tokens | Cost per call (USD) | Model latency |
+| --- | --- | ---: | ---: | ---: |
+| Gemini 3.8 Flash | high | 9,919 | 0.008652 | 5.11 s |
+| Gemini 3.8 Flash | low | 2,422 | 0.002978 | 4.60 s |
+| Gemini 3.5 Flash Lite | high | 9,919 | 0.003040 | 2.77 s |
+| Gemini 3.5 Flash Lite | low | 2,422 | 0.000804 | 1.63 s |
+| Gemini 3.1 Flash Lite | low | 2,422 | 0.000652 | 2.06 s |
+| Gemini 4 Hydrogen | low | 2,581 | 0.005407 | 2.53 s |
+
+Each Lite model was then tested on one additional, fresh live challenge at low detail.
+AWS accepted both answers and OpenRent resumed with HTTP 200. Those calls cost
+$0.000640 (3.1 Flash Lite) and $0.0008041 (3.5 Flash Lite). Across all 20 model calls,
+including the three baseline solves and 15 replays, OpenRouter reported $0.066040.
+
+Low detail reduced Gemini 3.x input usage by 75.6%. Gemini 3.1 Flash Lite with low
+detail reduced the measured mean total cost by 92.5% relative to the current setting.
+The defaults now select `google/gemini-3.1-flash-lite` with low image detail.
+`BROWSER_CAPTCHA_MODEL` can override the model. The existing single-attempt limit
+and manual fallback remain as implemented.
+This small sample is evidence of feasibility, not a long-term success-rate estimate.
+The experiments ran locally and did not modify production.
+
 ### Configuration
 
 The `Dockerfile` and GitHub workflow build and publish **one image** containing the
@@ -200,7 +235,7 @@ export OPENRENT_BROWSER_ALERT_TO='your-address@example.com'
 export BROWSER_CHROMIUM_SANDBOX=false
 # Export RESEND_TOKEN and OPENROUTER_API_KEY (or OPENROUTER_TOKEN) as usual.
 # The same OpenRouter credential is used for property reviews and CAPTCHA solving.
-export BROWSER_CAPTCHA_MODEL=google/gemini-3.8-flash
+export BROWSER_CAPTCHA_MODEL=google/gemini-3.1-flash-lite
 
 docker compose --env-file /dev/null config --quiet
 docker compose --env-file /dev/null pull openrent browser
