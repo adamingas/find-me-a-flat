@@ -252,7 +252,7 @@ class BrowserWorker:
             return False
         logger.info("Automatic CAPTCHA solve started; episode=%s", self.episode)
         try:
-            async with asyncio.timeout(min(30, remaining)):
+            async with asyncio.timeout(min(35, remaining)):
                 await self.solver.solve(self.page, snapshot)
             await self.page.reload(wait_until="domcontentloaded", timeout=5000)
             return True

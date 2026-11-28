@@ -50,6 +50,7 @@ services:
       BROWSER_CHROMIUM_SANDBOX: ${BROWSER_CHROMIUM_SANDBOX:-true}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-${OPENROUTER_TOKEN:-}}
       BROWSER_CAPTCHA_MODEL: ${BROWSER_CAPTCHA_MODEL:-google/gemini-3.1-flash-lite}
+      BROWSER_CAPTCHA_FALLBACK_MODEL: ${BROWSER_CAPTCHA_FALLBACK_MODEL:-google/gemini-3.8-flash}
     secrets:
       - browser_api_token
       - browser_vnc_password

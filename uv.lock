@@ -212,7 +212,7 @@ wheels = [
 
 [[package]]
 name = "awswaf"
-version = "0.0.0+0b7d9eb.1"
+version = "0.0.0+0b7d9eb.2"
 source = { directory = "vendor/awswaf" }
 dependencies = [
     { name = "cryptography" },

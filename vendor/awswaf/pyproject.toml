@@ -1,6 +1,6 @@
 [project]
 name = "awswaf"
-version = "0.0.0+0b7d9eb.1"
+version = "0.0.0+0b7d9eb.2"
 requires-python = ">=3.12"
 dependencies = ["curl-cffi>=0.14,<1", "cryptography>=46", "pyscrypt>=1.6,<2"]
 license = "MIT"

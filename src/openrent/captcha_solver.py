@@ -1,5 +1,6 @@
 """AWS CAPTCHA adapter and Gemini image selection, independent of alert delivery."""
 
+import asyncio
 import base64
 import json
 import logging
@@ -25,6 +26,36 @@ class CaptchaSolver(Protocol):
         ...
 
 
+class RetryingCaptchaSolver:
+    """Try an ordered sequence of solvers, stopping as soon as one succeeds."""
+
+    def __init__(self, attempts: tuple[CaptchaSolver, ...], *, attempt_timeout: float = 10):
+        if not attempts:
+            raise ValueError("At least one CAPTCHA attempt is required")
+        self.attempts = attempts
+        self.attempt_timeout = attempt_timeout
+
+    async def solve(self, page, snapshot):
+        for attempt, solver in enumerate(self.attempts, start=1):
+            logger.info("CAPTCHA attempt started; attempt=%s/%s", attempt, len(self.attempts))
+            try:
+                async with asyncio.timeout(self.attempt_timeout):
+                    await solver.solve(page, snapshot)
+            except Exception as exc:
+                # Error bodies can contain credentials or signed AWS challenge data.
+                logger.warning(
+                    "CAPTCHA attempt failed; attempt=%s/%s error=%s",
+                    attempt,
+                    len(self.attempts),
+                    type(exc).__name__,
+                )
+                if attempt == len(self.attempts):
+                    raise
+            else:
+                logger.info("CAPTCHA attempt succeeded; attempt=%s/%s", attempt, len(self.attempts))
+                return
+
+
 class ImageSelection(BaseModel):
     indices: list[StrictInt]
 
@@ -41,8 +72,9 @@ def validate_selection(indices, image_count):
 
 
 class GeminiImageSelector:
-    def __init__(self, config: OpenRouterConfig):
+    def __init__(self, config: OpenRouterConfig, *, detail: str = "low"):
         self.config = config
+        self.detail = detail
 
     async def __call__(self, images, target):
         if not isinstance(images, list) or not 1 <= len(images) <= 16:
@@ -62,10 +94,13 @@ class GeminiImageSelector:
                     {
                         "type": "input_image",
                         "image_url": f"data:image/jpeg;base64,{image}",
-                        "detail": "low",
+                        "detail": self.detail,
                     },
                 ]
             )
+        logger.info(
+            "CAPTCHA image selection started; model=%s detail=%s", self.config.model, self.detail
+        )
         async with self.config.create_client(timeout=25) as client:
             agent = Agent(
                 name="CAPTCHA image selection",
@@ -83,8 +118,10 @@ class GeminiImageSelector:
         indices = validate_selection(result.final_output.indices, len(images))
         usage = result.context_wrapper.usage
         logger.info(
-            "CAPTCHA image selection complete; model=%s images=%s input_tokens=%s output_tokens=%s",
+            "CAPTCHA image selection complete; model=%s detail=%s images=%s "
+            "input_tokens=%s output_tokens=%s",
             self.config.model,
+            self.detail,
             len(images),
             usage.input_tokens,
             usage.output_tokens,
@@ -175,4 +212,9 @@ def configuration(environ):
         settings.openrouter_api_key,
         environ.get("BROWSER_CAPTCHA_PROVIDER") or None,
     )
-    return AwsWafCaptchaSolver(GeminiImageSelector(config))
+    current = AwsWafCaptchaSolver(GeminiImageSelector(config))
+    fallback_config = replace(
+        config, model=environ.get("BROWSER_CAPTCHA_FALLBACK_MODEL", "google/gemini-3.8-flash")
+    )
+    fallback = AwsWafCaptchaSolver(GeminiImageSelector(fallback_config, detail="high"))
+    return RetryingCaptchaSolver((current, current, fallback))

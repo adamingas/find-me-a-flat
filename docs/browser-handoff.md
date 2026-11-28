@@ -89,9 +89,12 @@ the HTTP photo path, this is not a streaming network-download limit.
 1. AWS's `x-amzn-waf-action` header or recognized challenge HTML identifies a
    challenge. A missing `PROPERTYIDS` alone does **not** imply a CAPTCHA.
 2. Allow 15 seconds for JavaScript verification to finish automatically.
-3. If it persists, try the AWS CAPTCHA solver once, with a maximum 30-second
-   budget inside the request deadline. Gemini selects the puzzle images through
-   OpenRouter; the worker redeems AWS's voucher in the existing browser context.
+3. If it persists, try Gemini 3.1 Flash Lite twice at low image detail, then Gemini
+   3.8 Flash once at high detail. Each attempt fetches a fresh AWS puzzle and has a
+   ten-second timeout. Stop on the first successful token exchange. The sequence
+   has a maximum 35-second budget inside the request deadline, reserving five seconds
+   for reloading. Gemini selects images through OpenRouter; the worker redeems
+   AWS's voucher in the existing browser context.
    Reload the requested document and check that verification actually cleared.
 4. If solving fails or the document is still blocked, return `423` with an episode identifier. Keep the browser open,
    exempt it from idle shutdown, and stop new navigations.
@@ -194,11 +197,29 @@ including the three baseline solves and 15 replays, OpenRouter reported $0.06604
 
 Low detail reduced Gemini 3.x input usage by 75.6%. Gemini 3.1 Flash Lite with low
 detail reduced the measured mean total cost by 92.5% relative to the current setting.
-The defaults now select `google/gemini-3.1-flash-lite` with low image detail.
-`BROWSER_CAPTCHA_MODEL` can override the model. The existing single-attempt limit
-and manual fallback remain as implemented.
+These experiments selected `google/gemini-3.1-flash-lite` with low image detail as
+the primary model. `BROWSER_CAPTCHA_MODEL` can override it.
 This small sample is evidence of feasibility, not a long-term success-rate estimate.
 The experiments ran locally and did not modify production.
+
+### Retry policy — 28 November 2026
+
+The solver now makes at most three attempts per episode: primary model at low detail,
+the same model again at low detail, then `BROWSER_CAPTCHA_FALLBACK_MODEL` (default
+`google/gemini-3.8-flash`) at high detail. A composed retry adapter owns the sequence
+and per-attempt timeout; the AWS adapter owns each fresh puzzle and token exchange.
+Cancellation propagates immediately. Human-wait polling never restarts the sequence.
+
+Medium image detail was requested but OpenRouter's Responses API rejected
+`detail="medium"` with HTTP 400. A replay of a previously verified nine-image puzzle
+with `detail="auto"` used 9,919 input tokens; adding `media_resolution="medium"`
+still used 9,919. The fallback therefore uses supported high detail explicitly.
+These checks called OpenRouter through Paralimni without changing the running service.
+
+Logs include attempt number, model, image detail, token usage, and failure type.
+`SelectionRejected` means AWS rejected the selected images; `TokenExchangeFailed`
+means the selection passed but a voucher or verified token was missing. Exception
+bodies, image data, credentials, and signed challenge payloads are not logged.
 
 ### Configuration
 
@@ -236,6 +257,7 @@ export BROWSER_CHROMIUM_SANDBOX=false
 # Export RESEND_TOKEN and OPENROUTER_API_KEY (or OPENROUTER_TOKEN) as usual.
 # The same OpenRouter credential is used for property reviews and CAPTCHA solving.
 export BROWSER_CAPTCHA_MODEL=google/gemini-3.1-flash-lite
+export BROWSER_CAPTCHA_FALLBACK_MODEL=google/gemini-3.8-flash
 
 docker compose --env-file /dev/null config --quiet
 docker compose --env-file /dev/null pull openrent browser

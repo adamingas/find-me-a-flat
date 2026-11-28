@@ -13,6 +13,14 @@ class CaptchaRejected(ValueError):
     pass
 
 
+class SelectionRejected(CaptchaRejected):
+    """AWS rejected the selected images."""
+
+
+class TokenExchangeFailed(CaptchaRejected):
+    """AWS accepted the selection but did not issue a verification token."""
+
+
 async def solve_captcha(*, request, select_images, captcha_url, token_url, domain,
                         goku_props, existing_token):
     problem = await request(
@@ -34,12 +42,15 @@ async def solve_captcha(*, request, select_images, captcha_url, token_url, domai
         "locale": "en",
     })
     if result.get("success") is not True:
-        raise CaptchaRejected("AWS rejected the image selection")
+        raise SelectionRejected("AWS rejected the image selection")
+    voucher = result.get("captcha_voucher")
+    if not isinstance(voucher, str) or not voucher:
+        raise TokenExchangeFailed("AWS did not return a CAPTCHA voucher")
     result = await request("POST", token_url + "/voucher", {
-        "captcha_voucher": result["captcha_voucher"],
+        "captcha_voucher": voucher,
         "existing_token": existing_token,
     })
     token = result.get("token")
     if not isinstance(token, str) or not token:
-        raise CaptchaRejected("AWS did not return a verified token")
+        raise TokenExchangeFailed("AWS did not return a verified token")
     return token
